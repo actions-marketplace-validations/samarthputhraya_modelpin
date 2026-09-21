@@ -6,6 +6,547 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.1] - 2026-09-16
+
+### Added
+
+- **`python -m modelpin` runs the CLI.** The same commands, with nothing required on `PATH` —
+  for a venv you have not activated, a container that calls the interpreter directly, or a
+  Windows policy that blocks the generated `modelpin.exe`. It previously answered
+  `No module named modelpin.__main__`, which reads like a broken install.
+- **A machine-readable run record.** Every `modelpin check` writes
+  `.modelpin/runs/check-<from>-to-<to>-<time>.json` beside its archived report: the exit code,
+  every verdict with its signals and explanation, and every candidate run it recorded (prompts
+  excluded). Scripts no longer need to parse Markdown, and a reviewer can read every run behind a
+  verdict.
+- **Progress while a live run works:** one line per scenario, so a long `baseline` or `check`
+  no longer looks hung.
+- **`modelpin draft <file>`** drafts scenarios from one file of your app, using your configured
+  model (one call). Drafts go to `scenarios/.drafts/`, which `baseline` and `check` ignore. The
+  system prompt and tools are kept only if they appear in the file; user messages, canned tool
+  results and suggested assertions are marked as invented, and suggestions never become live
+  assertions. Key-shaped strings are redacted before the file is sent.
+
+### Fixed
+
+Found by walking the documented first-run path — a freshly built wheel in a clean environment,
+and one live `modelpin draft` on a real application file:
+
+- **`modelpin draft` dropped the system prompt when the file spread it over several string
+  fragments.** Python implicit concatenation and `+`-joined strings put quote characters and
+  `\n` escapes between the words the model hands back, so the "is this actually in the file?"
+  check — which compared raw text — reported *"the model's system prompt did not appear in the
+  file word for word"* and left out the single most important part of a scenario. Triple-quoted
+  blocks, JS template literals and YAML block scalars already matched, and still do. Quoting no
+  longer counts; every word must still be present, in order, in the file, so a prompt the model
+  invented is still refused.
+- **`modelpin init` recommended a command that could not run.** After `pip install modelpin`
+  (without the `[providers]` extra) it printed "Credentials for google are already set" and
+  "modelpin baseline" as the next step — and `baseline` then died with "The Google GenAI SDK is
+  not installed", exit 4. Every `init` that names `modelpin baseline` now names a missing SDK
+  first, including a re-run in a repo whose `modelpin.yaml` already existed — the case where
+  someone clones a configured repo onto a machine without the SDK.
+- **The Google adapter pointed at a different install command** (`pip install google-genai`)
+  than the OpenAI and Anthropic adapters and the README. All three now say
+  `pip install "modelpin[providers]"`, double-quoted so the printed line can be pasted into
+  `cmd.exe` as well as PowerShell, bash and zsh.
+
+Found by a live validation campaign on Gemini (Vertex AI) — 972 same-model checks and six real
+model upgrades, written up in
+[docs/live-validation.md](https://github.com/samarthputhraya/modelpin/blob/main/docs/live-validation.md):
+
+- **A decline was flagged on its phrasing.** One Gemini version said "I do not have the ability
+  to browse live URLs" and the next "I cannot access external URLs"; only the second matched a
+  refusal marker, so `check` failed the build on `refusal rate 0% -> 100%` over identical
+  behavior, twice. The markers now cover both, priced first on 3,524 stored baseline/candidate
+  pairs with 0 gate results changed.
+
+- **A prompt Gemini's safety filter blocks is a refusal, not an error.** `gemini-3.8-flash`
+  returned no candidates (`block_reason: SAFETY`) for an unsafe prompt in a public suite, and the
+  whole `baseline` exited 4.
+- **`baseline` keeps every scenario it could record.** One scenario the provider rejects is named
+  and skipped; the rest are saved and the command exits 3. Recording nothing at all still exits 4.
+- **Archived reports no longer vanish on Windows in deep folders.** The archive name carries both
+  model ids; past the Windows path limit it now falls back to a short name instead of failing.
+- **Examples beside a verdict say when a run stopped early** (the tool-call limit, the token
+  limit, the content filter).
+
+### Changed
+
+- **Live runs are about 4x faster.** A scenario's runs are sent to the provider together (up to
+  5 at a time), and separate runs are judged together. `[M]` 12 scenarios on `gemini-2.5-flash`
+  vs itself, judge `gemini-3.5-flash`, one run each: baseline 170 s → 43 s, check 208 s → 62 s. The runs are
+  independent samples by design and each run asks the judge exactly the same questions, so no
+  verdict changes.
+
+## [0.4.0] - 2026-09-15
+
+This release is about the first hour a new user spends with Modelpin: a config that works on
+the first try, a verdict that shows its evidence, a CI build that does not go red on a fluke,
+and Claude support.
+
+### Changed — how a build fails
+
+- **A regression must reproduce before `modelpin check` exits 1.** When a scenario looks like a
+  regression, Modelpin replays the candidate again and diffs the fresh runs on their own against
+  the same baseline. The build fails only if the same kind of change (tool calls, refusals, or
+  meaning) shows up again. A change that does not reproduce is reported as `changed_minor`,
+  with the first finding in full; one whose second sample recorded nothing exits 3. `[M]` On the
+  one tool-channel false alarm this project has recorded (MP-220), the fresh-sample check
+  withholds the alarm against all nine other same-model samples from the same run (an in-sample
+  check on the alarm this change was built against, not a rate). `[M]` Exact enumeration at
+  `runs: 5` (modelled: one optional call, binomial runs): a same-model alarm on an optional tool call made on half of runs
+  falls from 2.15% to 0.25% per scenario. The cost is recall on borderline changes: a tool call
+  dropping from 80% to 20% of runs is caught 22% of the time instead of 38%; complete changes
+  are caught as before. It does not fix an unusual baseline, which is recorded once and reused.
+  The pre-spend line states the extra calls. Disable with `--no-confirm`
+  (Action input `confirm: false`). The published false-positive measurements in
+  `docs/fp-measurement.md` describe the engine without this step and are unchanged.
+- **A judge or confirmation call that still fails after retries costs that scenario (exit 3),
+  not the whole run.** Before, one failed judge call discarded every paid replay.
+
+### Added
+
+- **Anthropic (Claude) provider and judge.** `providers: [anthropic]` with `ANTHROPIC_API_KEY`,
+  or Claude on Vertex AI with `ANTHROPIC_VERTEX_PROJECT_ID` and application-default credentials.
+  Multi-turn tool calls, refusal and stop-reason mapping, SDK retries. Newer Claude models accept
+  only default sampling, so a scenario's `temperature`/`top_p` is sent only to models that accept
+  it. `claude-*` judge ids route to Anthropic without `judge_provider:`. The adapter is verified
+  offline against the SDK's real request shapes; no live Claude run has been recorded yet.
+- **Example runs beside every flagged verdict**, on the console and in the PR comment: one
+  baseline run and one candidate run, so a reviewer can see what changed.
+- **`modelpin init` configures itself from your repository.** It reads the model your code calls
+  and the credentials you have set, and writes a matching `providers:` and a
+  `judge_model:` different from your current model. The starter scenario is now a sentiment classifier whose case-sensitive
+  assertion a model can actually meet; the old greeting starter's `must_contain: ["hello"]`
+  failed on most runs in a live Gemini check.
+- **`.modelpin/.gitignore`** is written the first time the store is created, so `git add` picks
+  up baselines and ignores per-run reports.
+- **New docs:** [How Modelpin works](https://github.com/samarthputhraya/modelpin/blob/main/docs/how-it-works.md)
+  and [Writing scenarios](https://github.com/samarthputhraya/modelpin/blob/main/docs/writing-scenarios.md).
+  The README is rewritten as a guide for a first-time user.
+
+### Fixed
+
+- **Google: a transient `429` or `5xx` no longer ends the run.** `google-genai` retries nothing
+  unless told to; `[M]` one shared-quota 429 on Vertex killed a whole `baseline`. Requests now
+  retry with backoff through the SDK. The SDK's "automatic function calling" warning no longer
+  prints into every run.
+- **Google: a namespaced call to a declared tool (`default_api.request_box`) is recorded under
+  its declared name (MP-237).** The prefix alone made one tool look like two.
+- **GitHub Action: `provider` no longer overrides `modelpin.yaml`.** It defaulted to `openai`
+  and was always passed, so a Gemini or Claude repo's CI replayed on OpenAI. It now defaults to
+  the config. The sticky comment lookup is paginated, and a comment that cannot be posted no
+  longer fails the job by itself.
+- **`--config` naming a file that does not exist is an error** (exit 4) instead of silently
+  running on defaults.
+- **Live calls work behind a TLS-inspecting corporate proxy on Windows and macOS**: Modelpin
+  trusts the operating system's certificate store (`truststore`, now in the `providers` extra).
+  Opt out with `MODELPIN_NO_TRUSTSTORE=1`.
+- **`modelpin scan`:**
+  - a path that does not exist is an error (exit 4), not "No model identifiers found"; a single
+    file can be scanned;
+  - `.tsx`, `.jsx`, `.mjs`, `.cjs`, Go, Ruby, Java, Kotlin, C#, PHP, Rust and Swift files are
+    read — a Next.js app's model calls were invisible;
+  - minified bundles and lockfiles are skipped, and bare `o1`/`o3`/`o4` count only in a model
+    context, so minifier variables are no longer reported as models;
+  - ids used as filenames (`gpt-4o-mini.csv`) and version wildcards (`gemini-3.x`) are dropped;
+  - Vertex (`claude-...@20251001`), Bedrock (`us.anthropic.claude-...`), vendor-prefixed and more
+    open-model ids are reported in full;
+  - only `.env.example`, `.env.sample` and `.env.template` are read; `.env` and `.env.local`
+    are no longer opened;
+  - the judge in Modelpin's own `modelpin.yaml` is not reported as an app dependency.
+
+## [0.3.1] - 2026-09-12
+
+### Security
+
+A security review of 0.3.0 found six issues. All six are fixed here. One of them — the
+baseline transcript, below — affects **every version this project has released**, not only
+0.3.0.
+
+**If you use the GitHub Action, check how you pin Modelpin.** The first item below let a
+model's output put a link into the comment our Action posts on your pull request. The fix is in
+the Modelpin package, so if you use `samarthputhraya/modelpin@v1` and have never set
+`modelpin-spec`, your next run installs 0.3.1 and picks the fix up with no change from you. If
+you pinned `modelpin-spec` to a version or a git ref (`modelpin[providers]==0.3.0`, for
+instance), **you must bump it** — you will not get the fix otherwise. Comments already posted by
+an affected run are not rewritten; delete any you do not trust.
+
+We know of no exploitation, and of no installation of the Action outside this repository. We
+have no telemetry, so that is an absence of evidence rather than a guarantee.
+
+- **A model could inject a link, image or HTML into the PR comment the Action posts.** The
+  comment escaped only block-level Markdown, and tool names come from the model — which can
+  hallucinate one. `[M]` A tool name of `escalate[Build passed - view logs](https://…)` rendered
+  as a masked link: a forged CI banner, linking anywhere, posted by our bot into your pull
+  request. Model ids from `modelpin.yaml` — which a pull request can edit — reached the same
+  comment unescaped at **29 interpolation sites, including every verdict header**, and at 9 more
+  in the published Report. Every untrusted value in both is now escaped, and the tests check the
+  RENDERED page, not the source text. **One residual, stated rather than hidden:** those tests
+  render CommonMark, which does not linkify a bare URL, while GitHub's GFM does. The escaping
+  targets that too, but it is `[A]` until confirmed on a real rendered comment.
+- **The baseline file our docs tell you to commit stored every prompt, once per run.** `[M]` A
+  key placed in a 2-scenario baseline's prompt appeared 10 times in the file. Nothing in the
+  comparison reads the prompt transcript, so baselines no longer store it; your prompts stay
+  where you wrote them, in your scenario files. Baselines recorded by 0.3.0 still load.
+
+  **This affects every version before 0.3.1, not just 0.3.0.** `[M]` `save_baseline` dumped the
+  full trace — `messages` included — in every release from 0.1.0 through 0.3.0, and
+  `actions/README.md` has instructed `git add … .modelpin/` since 0.1.2.
+
+  **If you have ever committed a `.modelpin/baseline-*.json` to a public repository, it contains
+  your prompts.** Two things to do, in this order:
+
+  1. **Rotate any credential that appeared in a prompt.** Assume it is public. This is the only
+     remedy that does not depend on rewriting history.
+  2. Re-record with `modelpin baseline` and commit. **This does not remove the old prompts** — a
+     new commit leaves the previous blob reachable in git history, in every existing clone and
+     fork, and through the GitHub API. Purging it needs a history rewrite (`git filter-repo`)
+     and a force-push, and even then forks and caches may retain it.
+
+  A re-recorded baseline still holds the model's **output text and the arguments of every tool
+  call**, verbatim, by design. The Action README now says exactly what each committed file holds
+  and when not to commit it.
+- **`modelpin scan` could report files outside the directory it was pointed at**, through a
+  Windows directory junction, which needs no privilege to create. Only file **paths**, line
+  numbers and model ids were shown, on your own terminal; no file content was read into the
+  output and nothing was transmitted. A path can itself be sensitive, which is why this is fixed
+  rather than accepted. Fixed for junctions and symlinks alike; a link that stays inside the
+  repository still works.
+- **`modelpin scan` could appear to hang on a minified JavaScript bundle.** The per-line
+  de-dupe was quadratic in matches per line, and a bundle is one enormous line. `[M]` Measured
+  here before the fix: 4 KB 0.03 s, 8 KB 0.10 s, 16 KB 0.56 s — quadrupling per doubling. It is
+  now linear: `[M]` the same shape at 96 KB scans in 0.08 s. (`[S] 2026-09-09` The security
+  review measured a 96 KB file at 105 s on its own machine; that figure is theirs, and is not a
+  before/after pair measured in one environment.) Files over 5 MB are skipped and named, never
+  skipped silently.
+- **Error messages missed six common credential shapes.** AWS access key ids, GitHub tokens,
+  PEM private keys and Azure storage keys are now redacted. Keys with no distinctive prefix
+  (Azure OpenAI's bare hex keys, for instance) are not recognised; the README says so rather
+  than claiming a failed call "never leaks your key", which it previously did.
+- **The Action referenced two third-party actions by movable tag.** Both are now pinned to the
+  exact commit their tags pointed to, so nothing you run changed — it just can no longer change
+  underneath you. `[M] 2026-09-11` The first dependency vulnerability scan this project has
+  run found no known vulnerability in the closure `pip install "modelpin[providers]"`
+  installs — **40 packages on Linux, 41 on Windows**, the difference being `colorama`, which
+  `click` and `typer` require only there — as of that date, against the advisory databases the audit
+  queried then. A CVE published after it changes that answer, which is exactly why CI now runs
+  the same audit on every change, blocking. The same scan **did** flag two advisories in
+  `black`, a dev-only formatter no customer installs; neither applies as this project uses it,
+  and the toolchain bump is tracked separately (MP-245).
+
+### Added
+
+- **`modelpin init --agent-example` writes a runnable agent scenario.** The tool-call
+  trajectory diff is the signal this project exists for, and until now the only worked
+  examples of `"kind": "agent"` lived in `examples/` on GitHub — which the wheel deliberately
+  does not ship. A newcomer had to leave the installed package to learn the main feature. The
+  flag scaffolds an annotated two-step refunds agent (`lookup_order` → `issue_refund`) with
+  canned tool results, generated by code so the wheel stays code-only.
+
+  It is behind a flag rather than in the default scaffold, and the reason is your bill: `[M]`
+  a `single` scenario costs one model call per replay while an agent scenario drives the tool
+  loop up to six, so scaffolding it by default would take a first `modelpin baseline` from 5
+  replays / 5 calls to 10 replays / up to 35 — spent on a fictional shop that measures nothing
+  about your app. `modelpin init` names the flag on both its branches, so it is findable
+  without leaving the package.
+
+### Changed
+
+- **`modelpin scan` separates models you CALL from models you merely mention, and reads your
+  documentation.** `[M]` On a one-file app beside a freshly `modelpin init`-ed config, scan
+  reported six rows and three distinct models — of which **a third of the rows**, and one
+  whole model, came from comments inside the `modelpin.yaml` Modelpin had just written
+  itself, explaining its own judge-collision rule. The tool was reporting itself as your dependency, on the first
+  command you run. `[M]` The same config also made scan blind in the other direction: `.md`
+  was not scanned, so a README saying "we use claude-3-5-sonnet as a fallback" produced
+  nothing at all.
+
+  The headline is now **"N distinct model(s) called"** and counts only wired-up calls and
+  active configuration. Mentions in YOUR comments and documentation are listed beneath
+  it, labelled and counted separately, because a `# TODO: evaluate gpt-5.5` is a real
+  intention worth showing and hiding it would be the same defect facing the other way. (A
+  model appearing only inside Modelpin's own config is dropped outright rather than
+  relabelled — the tool has no business reporting its own scaffold in either table.) `[M]` The reproduction
+  above goes from 6 rows / 3 distinct to **3 called rows / 1 distinct model called**, with the
+  other 2 listed separately as mentions, and the README model that was invisible is now found. `[M]` Documentation scanning was checked for fabrication on
+  two real repositories before being enabled — **37 documentation files actually scanned** (9 in a
+  real app, 28 in a site-packages tree), 14 prose rows, **3 distinct model ids, zero
+  invented**: each appears either in the same repo's code or inside a vendor SDK's own
+  `model="..."` sample. `.txt` stays excluded because scraped logs are where the last batch
+  of fabrications came from.
+
+- **The tool-trajectory gate was put to a new labelled calibration set and left unchanged.**
+  `[M] 2026-09-09` Both candidate preconditions from ADR-0041 were rejected on it, and
+  `modelpin/diff/` is untouched: no threshold, verdict or exit code moves. **This is not
+  evidence that the gate is safe and must not be read as any.** The set pre-registers its own
+  criterion — a run that flags nothing "does not discriminate the rules and must be reported
+  as a non-result, not as a success" — and this run's null arm flagged nothing, so it is
+  reported as a non-result. That set (`examples/calibration/tool/`, 35 labelled pairs) is a
+  tuning surface under ADR-0025, so no false-positive rate, detection rate or other result is
+  claimed from it and none is published here; the raw artifacts are committed under
+  `reports/tool-calibration/2026-09-09/` for anyone who wants to re-derive their own.
+
+  **The tool-channel false-positive rate of record is unchanged at 1 in 26 scored tool-exposed
+  trials, one-sided 95% upper bound 17.0%**, measured on the held-out `examples/fp-suite-v2`
+  corpus — but only **two distinct scenarios** contribute any scored trial and 24 of the 26
+  come from one of them, so per ADR-0042 D3 the constraining figure is **1 in 2 shapes, upper
+  bound 97.5%**. It bounds one shape, not tool use in general.
+
+### Fixed
+
+- **A scenario file that is valid JSON but not a valid scenario now says so in Modelpin's own
+  words.** The error carried pydantic's internal repr — a dict dump, `input_type=dict`, and a
+  link to *pydantic's* documentation — around the one sentence that actually said what was
+  wrong. It now reads like the malformed-JSON error beside it, reports every problem rather
+  than the first, and still exits `4`.
+
+- **The CLI reference table stopped printing the form PowerShell shadows.** Every runnable
+  block already said `modelpin`, but the table — what a reader skims instead of the prose —
+  said `mp init`, `mp scan`, `mp check`. `[M]` PowerShell's built-in `mp` alias
+  (`Move-ItemProperty`) fails with a `ParameterBindingException` containing no characters that
+  connect it to this tool, so a reader who copied from the table had nothing to search for.
+
+## [0.3.0] - 2026-09-08
+
+> ### ⚠️ Upgrading breaks your existing baselines. Re-run `mp baseline` once.
+>
+> **Every baseline recorded before this version will be refused, and your first `mp check`
+> after upgrading compares nothing and exits `3` until you re-record.** `mp baseline` now
+> stores a content fingerprint of each scenario *definition* beside its traces, and `mp check`
+> will not compare a scenario whose definition has changed since — or whose baseline carries
+> no fingerprint at all, which is every baseline that exists today.
+>
+> ```
+> mp baseline          # once, after upgrading. Then mp check works as before.
+> ```
+>
+> This is a deliberate cost. `[M]` The store keyed a baseline to a scenario by **id alone**
+> and got it wrong in both directions: a rewritten scenario compared against a stale baseline
+> reported `OK 1 scenario(s) unchanged`, exit `0`, over a candidate that had genuinely started
+> refusing; and two unrelated scenarios sharing a filename produced `REGRESSION (confidence
+> 0.99)`, exit `1`, off nothing but a name collision. Applying it to Modelpin's own tracked
+> dogfood baseline found the defect live. Full rationale below and in ADR-0039.
+>
+> **Also breaking, smaller:** a setup failure (missing key, bad config, usage error) now exits
+> **`4`**, not `1`. `1` means only a real regression. A caller treating any non-zero code as
+> "regression" will now see `4` where it saw `1`.
+
+Beyond the two breaking changes: the false-positive rate this project is named for is
+**bounded for the first time** on surfaces where a false alarm was actually possible, the
+semantic channel stops hiding a class of real regression, and five ways the tool could report
+something it had not measured — or discard something you had written — are closed. Three of
+those ended in a confident verdict; two of them spent your API key first.
+
+### Changed
+- **BREAKING: a baseline that cannot say which scenario it describes is no longer compared.**
+  `mp baseline` now records a content fingerprint of each scenario *definition* beside its
+  traces, and `mp check` refuses to compare a scenario whose definition has changed since — or
+  whose baseline records no fingerprint at all. **Every baseline recorded before this version
+  has none, so your first `mp check` after upgrading will compare nothing and exit `3` until you
+  re-run `mp baseline` once.** That is a real cost, taken deliberately: `[M]` the store keyed a
+  baseline to a scenario by **id alone**, and got it wrong in both directions. Rewriting a
+  scenario from `"Say hello."` to `"Delete the production database and confirm."` while leaving
+  the baseline gave `OK 1 scenario(s) unchanged`, exit `0`, over a candidate that had genuinely
+  started refusing — the stale store was the only difference between a green tick and a
+  `confidence 1.00` regression. And in the other direction, a fresh clone plus your own
+  `scenarios/refund_request.json` — a filename the README's own worked example uses — produced
+  `REGRESSION ... (confidence 0.99)`, exit `1`, off two scenarios sharing nothing but a name.
+  A refused scenario is **skipped, never failed**: it is not replayed (so you are not charged
+  for it), it is named on the console with both fingerprints, and the published report discloses
+  it as `NO USABLE BASELINE`. Exit `1` still means only a real regression. `[M]` Applying this to
+  Modelpin's own tracked dogfood baseline found the defect live — `order_status` had changed
+  meaning five days after that baseline was written. See ADR-0039.
+- **BREAKING (exit codes): a setup failure now exits `4`, not `1`.** `[M]` Every one of the
+  28 places the CLI reports a configuration, credential or usage problem exited `1` — the
+  code `check --help` documents as *"at least one real regression (the CI gate)"* and the
+  GitHub Action publishes as `::error::Modelpin detected a behavioral regression`. So a
+  contributor who had not yet added `OPENAI_API_KEY` to repository secrets received a public
+  annotation on their pull request stating that their model migration had regressed, with no
+  replay run and nothing compared. Exit `1` now means only what it always claimed to mean.
+  `0`, `1` and `3` are unchanged; `4` is new. A caller treating any non-zero code as
+  "regression" will now see `4` where it saw `1` — it was already reporting missing keys as
+  regressions, but it was doing so because of us. See ADR-0035.
+- **An unknown key in `modelpin.yaml` is now an error naming the key and its nearest match.**
+  `[M]` It was silently discarded, so `provider:` for `providers:` — singular, the most
+  natural slip on this file — loaded as the *default* provider, `openai`, at 5 runs. A config
+  written to get a free offline check billed your own key for five paid replays per scenario.
+
+### Packaging
+- **Version bumped to `0.3.0`.** `[M]` `pyproject.toml` still read `0.2.1` — a version already
+  tagged and published — while this release carries a breaking exit-code change. Nothing in the
+  suite compared the two, so the gate stayed green while the repo was un-releasable. A test now
+  fails if the declared version matches an existing tag.
+- **`modelpin version` now reads the installed distribution, not a second hardcoded copy.**
+  `[M]` `modelpin/__init__.py` held its own literal, so the bump moved `pyproject.toml` and left
+  `modelpin version` printing `0.2.1` — the string a bug report quotes. A test now pins the two
+  together.
+- **The sdist ships `actions/`.** `[M]` An sdist installed exactly as `CONTRIBUTING.md`
+  instructs failed 3 of its own tests, from two missing directories. `actions/` — the Action's
+  published output-contract docs — is now grafted. `.github/` deliberately stays out (it is a
+  hidden path, which the sdist invariant forbids); the two repo-hygiene tests that read it now
+  skip outside a checkout.
+
+### Added
+- **A scenario can pin its own tool-call match mode.** `"match": "strict" | "unordered" |
+  "subset" | "superset"` in a scenario file overrides the run's `--match` for that scenario
+  alone; scenarios that declare nothing keep using the flag, so nothing changes for anyone who
+  does not opt in. The run header and the published Report both name every scenario that
+  overrode the flag, so a run that used two modes never publishes one.
+
+  This exists because `--match` was global and some prompts make a tool call *optional*.
+  `[M]` On a same-model, same-prompt null, a scenario whose system prompt says of its second
+  tool *"use it when it would be useful"* had the model send the courtesy email on 4 of 5
+  baseline samples and 0 of 5 candidate samples, and Modelpin published `regression` at
+  confidence 0.952 and exit `1` — a red build for a model using discretion the prompt handed
+  it. `[M]` Under `subset` that comparison does not fire at all, and `[M]` a global `subset`
+  default would silence the tool channel on 7 of the 10 tool-channel detection rows in our
+  recall arm (those 7 are still caught by the semantic judge, so no detection loss is
+  measured — over only 4 distinct scenarios, 95% upper bound 52.7%) — so the relation belongs
+  to the scenario that holds it, not to a global default. The engine's thresholds are unchanged and `modelpin/diff/` is
+  untouched; the underlying tool-channel false positive remains open — measured on its own
+  corpus at 1 in 26 scored tool-exposed trials, one-sided 95% upper bound 17.0%, which is a
+  different run from the false-positive rate of record below and is never pooled with it —
+  and its published bound is unmoved.
+
+  **Adding `"match"` does not invalidate a baseline you already paid to record.** The scenario
+  fingerprint introduced in this version deliberately excludes it: the field changes how two
+  recordings are compared and cannot change a byte sent to a provider, so a baseline recorded
+  before the declaration still describes the scenario exactly.
+
+- **The false-positive rate of record is bounded for the first time.** `[M]` 710 same-model
+  comparisons at the shipped defaults on 2026-09-07: **0 false alarms in 39 scored trials**
+  (one-sided 95% upper bound **7.4%**), and 0 in the 710 that reached a verdict (upper bound
+  **0.4%**, reported for completeness — 671 of those 710 could not have fired at any threshold)
+  — on two OpenAI models plus a 12-trial single-repeat sanity arm on Groq that constrains
+  nothing, with the semantic judge on. The bound is carried by 9 of 27 scenario shapes, and
+  **30 of its 39 trials could only have fired on the argument gate, which is advisory and can
+  never fail a build on its own**; **on this run** the tool-call and assertion channels saw no exposure at all — both have
+  since been measured on their own corpora, and each produced one false alarm; see the two
+  entries below.
+  Detection on the same surfaces: **45 of 46** perturbed replays flagged (**21 of 22** distinct
+  perturbations on every surface). Until this release the document the README pointed to for this number read
+  *"0 false alarms in 0 scored trials"*: every set that had ever been run ran at temperature 0,
+  where every channel returned `p = 1.00` and no trial could fire (the seven `arg_*` scenarios at
+  0.7 had existed since MP-54 but had never been run under the shipped engine). Every trial and
+  its traces are committed under `reports/fp-runs-adr0040/2026-09-07/` (the original replays are
+  kept beside them in `reports/fp-runs/2026-09-07/`), and a test regenerates the
+  published block from them. Bound, not zero; see `docs/fp-measurement.md` for what it does not
+  say — including that 30 of the 39 scored trials sat on the advisory argument gate, that the
+  detection increase is partly in-sample, and that the new semantic rule's safety is conditional
+  on judge leniency and not yet priced.
+- **The published false-positive rate is split by severity, and the hard one is read first
+  (ADR-0042).** `[M]` One pooled rate covered two verdicts whose consequences are not
+  comparable: `scripts/fp_measurement.py` counts an advisory `changed_minor` on a same-model
+  null exactly like a red build, and **30 of the run of record's 39 scored trials could only
+  ever have fired on the advisory argument gate**, which can never exit `1`. So 77% of the
+  denominator behind the number quoted for *"if Modelpin says it broke, it broke"* was a
+  channel a user's CI never sees. The page now leads with **0 in 9 hard-exposed trials, upper
+  bound 28.3% — 6 distinct scenarios, so 39.3%** — beside the advisory **0 in 30 (9.5%; 3
+  shapes, 63.2%)** and the unchanged pooled **0 in 39 (7.4%)**. `[M]` The hard bound's 9 trials
+  are **8 semantic + 1 refusal + 0 tool + 0 assertion**: it constrains the tool trajectory not
+  at all, and the split makes that visible in the headline. **The classifier is unchanged and
+  no verdict, exit code or pooled number moves** — reclassifying `changed_minor` as clean would
+  hand every future channel a way out of the north-star metric. The split is re-derived offline
+  from the committed artifacts, never recorded by the engine (`modelpin/diff/` is frozen), and
+  `tests/test_fp_severity.py` pins each channel's severity behaviourally. The two denominators
+  overlap and are never summed.
+- **The format/assertion channel has a false-positive bound for the first time, in either
+  direction — and it is not zero.** `[M]` **1 false alarm in 30 scored assertion-exposed trials
+  = 3.3%, one-sided 95% upper bound 14.9%**; over **7 distinct scenarios** that is `1/7`, upper
+  bound **52.1%**, and per ADR-0042 the shape figure is the one that constrains. 312 same-model
+  trials on `examples/fp-suite-v3`, two OpenAI models each judged by the other, both anchors
+  quiet; artifacts under `reports/channel-exposure/2026-09-08/`, reproducible offline with
+  `python scripts/channel_exposure.py reports/channel-exposure/2026-09-08/v3[abcd]-*.jsonl`.
+  The flagged trial is published as a false positive with its traces
+  (`standup_digest_keeps_the_ids#6`, `changed_minor @ 0.996`) — it is advisory and could not
+  have failed a build, which is a fact about severity, not a reason to discount it. `[M]` The
+  run is 312 trials, not the 400 pre-registered: one of four surfaces returned a provider error
+  on 88 of its 100 trials. Both models and both judges are OpenAI; no scenario in this corpus
+  declares `tools`, so it says nothing about the tool trajectory.
+- **The semantic channel compares each candidate run to every baseline run**, not to one
+  arbitrary modal baseline run (ADR-0040). `[M]` It fixes two *measured* false negatives — a
+  candidate that answered differently on 5 of 5 runs read `unchanged` because the judge also
+  called 2–4 of the 5 baseline runs non-equivalent to an arbitrarily chosen reference — and
+  detection rises 43/46 → 45/46 with 0 new false alarms across 710 same-model trials. It is not
+  free: `[M]` judge calls per run rise about **4.4×**, the scored denominator of the published
+  bound halves (82 → 39), and on an exact enumeration of a modelled null the rule is
+  **1.6×–9.6× more prone to a false alarm** at the shipped `runs: 5`, with its measured safety
+  conditional on the judge being lenient — ADR-0040's fourth falsifier is open.
+- **`examples/fp-suite/`**: twelve held-out scenarios modelled on long-tail apps at the API's default
+  temperature (1.0) — the first scenario set in the repo on which a same-model false alarm can
+  actually occur. Role `score`; reviewed before its first run; never edited after.
+- **`scripts/fp_measurement.py` can be cut and resumed, and re-scored without a key.** `--out`
+  writes one JSON line per trial (verdict, repertoires, traces) as it completes; `--resume`
+  continues from the trial a rate limit stopped on and refuses an artifact recorded under another
+  configuration; `--rescore` rebuilds both arms offline; `--workers` runs trials concurrently with
+  an identical report at any count; `--only` restricts a smoke run. Nineteen more perturbations
+  (seven `arg_*`, twelve `fp-suite`). `scripts/fp_aggregate.py` pools artifacts into the
+  published tables, conditional and unconditional rates each with their bound.
+- **`mp scan` now sees Llama, Qwen, Mistral, DeepSeek and `gpt-oss` ids, and reads `.env.example`.**
+  `[M]` It was OpenAI/Anthropic/Google-shaped: a repo naming `llama-3.3-70b-versatile`,
+  `qwen/qwen3-32b` and `openai/gpt-oss-20b` scanned to `No model identifiers found.`, exit 0 —
+  while appending one `gpt-4o-mini` line to that same file produced a populated table. `scan` is
+  the first command of the README's "real flow, on your own app", and cross-vendor coverage is
+  the point of the tool, so a Groq or Together shop met a confident empty result. `[M]` The new
+  patterns were measured over the same 6,228 third-party files used to narrow the o-series: the
+  only false positive was `deepseek-ai`, a HuggingFace org rather than a model, and the shipped
+  pattern enumerates DeepSeek's real families to exclude it.
+
+### Fixed
+- **`mp scan` no longer invents model ids out of URLs and asset filenames.** `[M]` On a real
+  repo that does not call an LLM at all, **28 of 28 hits were fabricated** — a percent-encoded
+  news slug, an article headline, and base64 PNG data — all from URLs inside scraped JSON. The
+  correct answer was zero. Measured across four real repos before shipping: those 28 dropped to
+  0 with **zero true positives lost** elsewhere.
+- **`mp scan` no longer reports Modelpin's own `.modelpin/` store as your dependencies.** `[M]`
+  On a real repo it was **61 of 76 hits — 80% of the table** — the recorded traces of a previous
+  run, in the directory the Action docs tell you to commit.
+- **Scenarios in a subdirectory were silently skipped.** `[M]` `scenarios/auth/nested.json`
+  holding a real refusal regression produced `OK 1 scenario(s) unchanged`, exit 0 — a green
+  tick over a regression, caused by nothing but putting scenarios in folders. Directories
+  named `results`, `__pycache__` and anything dot-prefixed are still skipped, so run output
+  kept beside your scenarios is not read as a scenario.
+- **Two scenario files sharing an `id` are now rejected, naming both files.** `[M]` One
+  recording was silently overwritten — after both had been replayed and paid for — while the
+  console still reported the full scenario count and the PR comment published
+  `**REGRESSIONS (3)**` for two distinct regressions, listing one of them twice.
+- **A non-ASCII scenario or model id no longer crashes the CLI on a non-UTF-8 console.**
+  `[M]` On a stock Windows console it raised `UnicodeEncodeError` while printing the summary
+  and exited `1` — again publishing "detected a behavioral regression", over byte-identical
+  traces, while the report written moments earlier said `**UNCHANGED (1)**`. Unencodable
+  characters are now escaped for display only; the artifact keeps its real bytes.
+- **The semantic judge is now checked against BOTH compared models, not just the candidate.**
+  `[M]` It compared only against `--to`, so a judge equal to the *baseline* never triggered the
+  independence note — and that is exactly what `mp init` shipped, writing `gpt-4o-mini` as both
+  the app's model and the judge. A new user's first `check` had the judge reading its own output
+  as the reference, silently. The scaffolded config now says so at the point of editing.
+- **The coverage disclosure no longer contradicts the verdict printed above it.** `[M]` In a
+  run whose only finding was a tool-call regression, the footer stated three things that were
+  all false of it: that the tool-trajectory channel was inert, that the scenario "called no
+  tool" (its baseline called one in 5 of 5 runs), and that "no CI-failing channel could see a
+  content change". It fires when a scenario omits `tools` while its recorded traces carry them.
+  The scenario is still not credited with coverage — that conservatism is deliberate and
+  unchanged — but the disclosure now says what actually happened.
+- **Provider error text is no longer silently truncated.** `[M]` It was cut at 300 characters
+  and closed with punctuation, so the result read as a complete sentence while the remedy —
+  which providers put at the *end* — was gone, with nothing saying anything had been removed.
+  Both ends now survive, with a visible `[... N chars elided ...]` marker between them.
+- **An unwritable baseline store now gives an error, not a traceback and a stray `.tmp`.**
+  `[M]` `save_baseline`'s atomic write had no failure path: the `OSError` escaped uncaught and
+  the half-written temp file was left in the directory the docs tell you to commit.
+- **The PR comment no longer says "could not measure" on a run that exits 0.** `[M]` `check
+  --help` binds that phrase to exit **3**, so a PR could get a green check beside a comment
+  whose headline described a different exit code. The refusal to give an affirmative green
+  header is unchanged and correct; the headline now says the narrower true thing — *only a
+  refusal could have failed this run* — matching the wording the published Report already used.
+- **A model id containing markup or a `|` no longer corrupts output.** `[M]` `--to 'm2[/]'`
+  raised `MarkupError`; `--to 'm2|evil'` added a cell to the published Report's settings
+  table and broke the row.
+
 ## [0.2.1] - 2026-09-02
 
 Two ways a run could report `looks safe to adopt` over something it never measured are
@@ -896,7 +1437,9 @@ not the exit code.
   opinion-framed Markdown + JSON report.
 - BYO-key throughout, with key-shaped-secret scrubbing on all output.
 
-[Unreleased]: https://github.com/samarthputhraya/modelpin/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/samarthputhraya/modelpin/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/samarthputhraya/modelpin/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/samarthputhraya/modelpin/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/samarthputhraya/modelpin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/samarthputhraya/modelpin/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/samarthputhraya/modelpin/compare/v0.1.1...v0.1.2

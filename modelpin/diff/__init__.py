@@ -34,6 +34,9 @@ from modelpin.diff.structural import (
     has_tool_arguments,
     modal_arg_sequence,
     modal_sequence,
+    leave_one_out_references,
+    relation_arg_reference,
+    relation_reference,
     name_trajectory_is_stable,
     refusal_rate,
     refused_flags,
@@ -174,6 +177,77 @@ def _abstention_explanation(n_base: int, d_base: int, n_cand: int, d_cand: int) 
     return "insufficient evidence: " + "; ".join(parts) + "; nothing to compare"
 
 
+def _intermittent_dropped_calls(
+    baseline_traces: Sequence[Trace], candidate_traces: Sequence[Trace]
+) -> dict[str, tuple[int, int]]:
+    """Calls the candidate stopped making that the baseline ITSELF made only sometimes.
+
+    Returns ``{tool_name: (baseline_runs_that_called_it, baseline_runs)}``, empty when the
+    shape does not apply. The caller reports those counts verbatim and draws no conclusion
+    from them -- see the last paragraph for why that restraint is the whole design.
+
+    MP-247. MP-220 is an open, disclosed false positive: an optional call the model makes on
+    4 of 5 baseline runs and 0 of 5 candidate runs clears the gate and publishes `regression` at
+    confidence 0.952 with exit 1, on a same-model, same-prompt null. `README.md` says so, and a
+    user meets it as a red build on their pull request -- somewhere they will act on it long
+    before they read a limitations section.
+
+    So the explanation says it at the point of the alarm. The condition is deliberately narrow,
+    because the failure mode of a hint is worse than the failure mode of silence: telling
+    someone to declare ``subset`` over a call their prompt actually requires would convert a
+    TRUE regression into a silenced one, and this project's whole claim is that a red build
+    means something.
+
+    THE PREDICATE IS ABOUT THE DROPPED TOOL, NOT THE TRAJECTORY. `[M] 2026-09-12` The first
+    version of this asked whether the baseline TRAJECTORY was multimodal, which is a different
+    question from the one the sentence answers, and the FP review measured the cost on this
+    project's own committed traces: **9 hints published, 8 of them on trials labelled real
+    regressions**, and following the advice turned 7 into `unchanged @ 1.000`. On
+    `tc_sailmaker_cloth_check` the baseline called `check_cloth_stock` on 5 of 5 runs and the
+    candidate on 0 of 5 -- while the engine printed "the baseline itself made this call on some
+    runs and not others", because an UNRELATED tool moved position. That is not a weak hint, it
+    is the tool asserting a measurable falsehood about the run it is describing, in support of
+    an instruction the user has no reason to doubt.
+
+    So all three must hold, and each kills a family the review found:
+
+    * **Something was actually dropped.** `dropped = base_tools - cand_tools` is non-empty.
+      Without this a pure REORDER or a count change fires the hint, and the sentence claims a
+      drop that did not happen -- 82% of firings on the review's synthetic sweep, including a
+      candidate that transferred funds before checking the balance.
+    * **Every dropped tool was INTERMITTENT in the baseline.** Its presence rate across
+      baseline runs is strictly between 0 and 1 -- the model itself made that call on some runs
+      and skipped it on others with nothing changed. This is the clause that was missing, and
+      it is the one that makes the sentence true. A tool on 5 of 5 baseline runs is required by
+      observation, whatever else varied.
+    * **The candidate added nothing.** Every tool it called, the baseline also called. A
+      candidate that invents a call is a plan change whatever the baseline did.
+
+    What this still cannot know is whether an intermittently-called tool was
+    required-when-applicable -- called only when the input warranted it. That is why the
+    sentence offers `subset` conditionally and says plainly that a required call means the mode
+    should stay, rather than recommending the change.
+
+    This is explanation text. It cannot move a verdict, a confidence or an exit code -- it runs
+    inside the branch that already decided `regression`.
+    """
+    base_tools = {name for t in baseline_traces for name in tool_call_sequence(t)}
+    cand_tools = {name for t in candidate_traces for name in tool_call_sequence(t)}
+    runs = len(baseline_traces)
+    if not runs or not base_tools or not cand_tools <= base_tools:
+        return {}
+    dropped = base_tools - cand_tools
+    if not dropped:
+        return {}
+    rates: dict[str, tuple[int, int]] = {}
+    for name in sorted(dropped):
+        present = sum(1 for t in baseline_traces if name in tool_call_sequence(t))
+        if present == 0 or present == runs:
+            return {}
+        rates[name] = (present, runs)
+    return rates
+
+
 def diff_scenario(
     scenario_id: str,
     from_model: str,
@@ -221,16 +295,31 @@ def diff_scenario(
     # dropped call under subset, an added call under superset) as a regression — a false
     # positive on the cardinal metric. For those, score each run by whether it VIOLATES the
     # baseline relation and gate a *rise* in the violation rate (one-sided, like refusal).
+    tool_measured = True
     if mode in EQUIVALENCE_MODES:
         base_keys = [canonical_sequence(tool_call_sequence(t), mode) for t in baseline_traces]
         cand_keys = [canonical_sequence(tool_call_sequence(t), mode) for t in candidate_traces]
         tool_tvd = total_variation_distance(base_keys, cand_keys)
         tool_p = permutation_pvalue_distribution(base_keys, cand_keys)
     else:
-        ref_seq = modal_sequence(baseline_traces, mode)
+        # MP-114: the baseline's REPERTOIRE, not one representative run. See
+        # `relation_reference`. The CANDIDATE is scored against the whole baseline; each
+        # baseline run is scored against the other n-1 (`loo` below), so neither side is
+        # graded against a reference it helped build.
+        ref_seq = relation_reference(baseline_traces, mode)
+        # An EMPTY `superset` reference means the baseline shared no call across all its
+        # runs, so the mode requires nothing and no candidate run can violate it. That is a
+        # vacuous 1.0, not a clean one. (An empty `subset` reference is the opposite: the
+        # baseline called no tool at all, so ANY candidate call is a violation -- real, and
+        # measured.)
+        tool_measured = not (mode == "superset" and not ref_seq)
+        # Leave-one-out on the baseline side, so BOTH sides are scored out-of-sample.
+        # See `leave_one_out_references`: without it the baseline cannot violate a
+        # reference it helped build, and the candidate fires on novelty alone.
+        loo = leave_one_out_references(baseline_traces, mode)
         base_viol = [
-            0 if trajectory_match(ref_seq, tool_call_sequence(t), mode) else 1
-            for t in baseline_traces
+            0 if trajectory_match(loo[i], tool_call_sequence(t), mode) else 1
+            for i, t in enumerate(baseline_traces)
         ]
         cand_viol = [
             0 if trajectory_match(ref_seq, tool_call_sequence(t), mode) else 1
@@ -284,6 +373,7 @@ def diff_scenario(
         and has_tool_arguments(candidate_traces)
         and name_trajectory_is_stable(baseline_traces, candidate_traces, mode)
     )
+    args_measured = args_compared
     if args_compared:
         if mode in EQUIVALENCE_MODES:
             base_akeys = [canonical_sequence(tool_arg_sequence(t), mode) for t in baseline_traces]
@@ -294,10 +384,13 @@ def diff_scenario(
             # Mirror the name signal's own dispatch. Bucketing a directional mode by a key
             # would flag the very change the mode PERMITS: under `subset` a dropped whole
             # call must stay legal even though dropping it changes the argument key too.
-            ref_aseq = modal_arg_sequence(baseline_traces, mode)
+            # MP-114, same fix as the name signal above.
+            ref_aseq = relation_arg_reference(baseline_traces, mode)
+            args_measured = not (mode == "superset" and not ref_aseq)
+            aloo = leave_one_out_references(baseline_traces, mode, arguments=True)
             base_aviol = [
-                0 if trajectory_match(ref_aseq, tool_arg_sequence(t), mode) else 1
-                for t in baseline_traces
+                0 if trajectory_match(aloo[i], tool_arg_sequence(t), mode) else 1
+                for i, t in enumerate(baseline_traces)
             ]
             cand_aviol = [
                 0 if trajectory_match(ref_aseq, tool_arg_sequence(t), mode) else 1
@@ -382,8 +475,15 @@ def diff_scenario(
         # directly and never this field. Nothing in `diff/` consumes it; it is rendered
         # (`report/__init__.py`), persisted in the report sidecar, and carried wholesale into
         # `scripts/drift_map.py` output via `model_dump()`.
-        tool_call_match=round(1.0 - tool_tvd, 3),  # 1.0 == identical tool-NAME trajectory
-        tool_arg_match=round(1.0 - arg_tvd, 3) if args_compared else None,
+        #
+        # MP-114's other half. `1.0` under a directional mode means "no candidate run broke
+        # the relation", and where the relation constrains NOTHING that is vacuous, not a
+        # measurement. `superset` over a baseline that never repeated a call requires
+        # nothing of the candidate, so no run could have violated it -- and the table used
+        # to print `1.00`, which a reviewer reads as "identical". `None` is the field's
+        # documented word for "not measured", and the renderer already prints it as `—`.
+        tool_call_match=round(1.0 - tool_tvd, 3) if tool_measured else None,
+        tool_arg_match=(round(1.0 - arg_tvd, 3) if args_measured else None),
         format_valid=not fmt_drift,
         refusal_delta=round(refusal_delta, 3),
         semantic_score=semantic_score,
@@ -407,10 +507,26 @@ def diff_scenario(
         verdict = DiffVerdict.regression
         hard_pvalues.append(tool_p)
         if mode in EQUIVALENCE_MODES:
-            reasons.append(
+            reason = (
                 f"tool-call behavior changed: {list(modal_sequence(baseline_traces, mode))} "
                 f"-> {list(modal_sequence(candidate_traces, mode))}"
             )
+            rates = _intermittent_dropped_calls(baseline_traces, candidate_traces)
+            if rates:
+                # MP-247. The counts are measured; the reading is left to the user, on
+                # purpose. See the helper for what this deliberately does NOT conclude.
+                measured = ", ".join(
+                    f"{name} on {hit} of {runs}" for name, (hit, runs) in rates.items()
+                )
+                reason += (
+                    f"  (your baseline was already inconsistent about this: {measured} "
+                    "baseline runs, and the candidate made none. An inconsistent call may be "
+                    "one the model uses at its discretion, in which case declaring "
+                    '"match": "subset" on this scenario says so -- or one it makes only when '
+                    "the input calls for it, in which case this is a real regression and the "
+                    "mode should stay. Modelpin cannot tell those apart from the runs alone.)"
+                )
+            reasons.append(reason)
         else:
             reasons.append(
                 f"tool-call trajectory now violates the '{mode}' relation vs baseline "

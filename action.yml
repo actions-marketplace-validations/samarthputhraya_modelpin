@@ -18,11 +18,16 @@ inputs:
     required: false
     default: ""
   provider:
-    # MP-128: `anthropic` is a STUB that raises NotImplementedError. Listing it unmarked
-    # made this the one place where following the documentation reaches a crash.
-    description: "Provider for the candidate replay: openai | google | groq | openrouter | together | cerebras. (`anthropic` is NOT yet implemented and will fail the run.)"
+    # MP-128: this list is checked against the adapters by tests/test_advertised_providers.py,
+    # so a provider named here that cannot run fails the build rather than a user's CI.
+    #
+    # Default "" and passed only when set. It defaulted to "openai" and was ALWAYS passed as
+    # `--provider`, which overrides `providers:` in modelpin.yaml -- so a Gemini or Claude repo
+    # that configured its provider in the file, as `modelpin init` writes it, had its CI
+    # replay on OpenAI and fail asking for OPENAI_API_KEY.
+    description: "Provider for the candidate replay: openai | google | anthropic | groq | openrouter | together | cerebras. Defaults to `providers:` in modelpin.yaml. `anthropic` reads ANTHROPIC_API_KEY, or runs Claude on Vertex AI when ANTHROPIC_VERTEX_PROJECT_ID is set (Application Default Credentials)."
     required: false
-    default: "openai"
+    default: ""
   config:
     description: "Path to modelpin.yaml."
     required: false
@@ -39,6 +44,10 @@ inputs:
     description: "Tool-call match mode: strict | unordered | subset | superset."
     required: false
     default: "strict"
+  confirm:
+    description: "Replay a flagged scenario again and fail only if the regression reproduces (recommended). Set to 'false' to fail on the first sample."
+    required: false
+    default: "true"
   baseline:
     description: "Record a fresh baseline for `from` before checking (needs the old model still available). Usually you commit the baseline instead."
     required: false
@@ -80,7 +89,14 @@ runs:
   using: "composite"
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v6
+      # MP-244. Pinned to a full commit SHA, never a floating tag: this file runs inside
+      # OTHER people's CI with their secrets in scope, and a moved tag is remote code
+      # execution that needs no access to this repository (tj-actions/changed-files,
+      # March 2025). `release.yml` already held that standard; the file we ask
+      # consumers to run did not. [S] 2026-09-11 GitHub API: floating `v6` and `v6.3.0`
+      # both dereference to this commit, and v6.3.0 is the newest v6 -- so pinning
+      # changes nothing a consumer runs today; it stops it changing underneath them.
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
       with:
         python-version: ${{ inputs.python-version }}
 
@@ -105,7 +121,8 @@ runs:
         MP_SCENARIOS_DIR: ${{ inputs.scenarios-dir }}
         MP_RUNS: ${{ inputs.runs }}
       run: |
-        args=(--provider "$MP_PROVIDER" --config "$MP_CONFIG")
+        args=(--config "$MP_CONFIG")
+        [ -n "$MP_PROVIDER" ] && args+=(--provider "$MP_PROVIDER")
         [ -n "$MP_FROM" ] && args+=(--model "$MP_FROM")
         [ -n "$MP_SCENARIOS_DIR" ] && args+=(--scenarios-dir "$MP_SCENARIOS_DIR")
         [ -n "$MP_RUNS" ] && args+=(--runs "$MP_RUNS")
@@ -125,9 +142,12 @@ runs:
         MP_SCENARIOS_DIR: ${{ inputs.scenarios-dir }}
         MP_RUNS: ${{ inputs.runs }}
         MP_WORKDIR: ${{ inputs.working-directory }}
+        MP_CONFIRM: ${{ inputs.confirm }}
       run: |
         set +e
-        args=(--to "$MP_TO" --provider "$MP_PROVIDER" --match "$MP_MATCH" --config "$MP_CONFIG")
+        args=(--to "$MP_TO" --match "$MP_MATCH" --config "$MP_CONFIG")
+        [ -n "$MP_PROVIDER" ] && args+=(--provider "$MP_PROVIDER")
+        [ "$MP_CONFIRM" = "false" ] && args+=(--no-confirm)
         [ -n "$MP_FROM" ] && args+=(--from "$MP_FROM")
         [ -n "$MP_SCENARIOS_DIR" ] && args+=(--scenarios-dir "$MP_SCENARIOS_DIR")
         [ -n "$MP_RUNS" ] && args+=(--runs "$MP_RUNS")
@@ -139,7 +159,14 @@ runs:
 
     - name: Post PR comment
       if: ${{ inputs.comment == 'true' && github.event.pull_request.number }}
-      uses: actions/github-script@v9
+      # A comment that cannot be posted (a pull request from a fork gets a read-only token)
+      # must not turn the job red by itself: the verdict is gated by the step below, and the
+      # report is still in the job log and at `report-path`.
+      continue-on-error: true
+      # MP-244, same reason as setup-python above. [S] 2026-09-11 GitHub API: `v9` and
+      # `v9.0.0` are two annotated tag objects that both dereference to this one commit,
+      # and they are the only v9 tags -- so this is exactly what `@v9` resolved to.
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
       env:
         REPORT_PATH: ${{ steps.check.outputs.report }}
       with:
@@ -156,7 +183,9 @@ runs:
           }
           const { owner, repo } = context.repo;
           const issue_number = context.payload.pull_request.number;
-          const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+          // Paginated: a busy pull request has more than one page of comments, and missing
+          // the marker on page 2 would post a duplicate report on every run.
+          const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
           const existing = comments.find(c => c.body && c.body.includes(marker));
           if (existing) {
             await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
@@ -171,11 +200,27 @@ runs:
         MP_TO: ${{ inputs.to }}
         MP_CODE: ${{ steps.check.outputs.code }}
       run: |
+        # Every branch here asserts something about a real person's model migration, in
+        # public, on their PR. It must never assert a measurement that was not made.
+        #
         # Exit 3 means we could NOT measure, which is not the same claim as "it regressed".
         # Saying "regression" there would put a false statement in the PR. See ADR-0018.
+        #
+        # Exit 4 means we never produced a verdict AT ALL -- missing key, bad flag, unreadable
+        # config. [M] 2026-09-06 this used to be exit 1 and fell to the `else` below, so a
+        # contributor who had not yet added OPENAI_API_KEY to repository secrets was told, in
+        # a GitHub error annotation, that Modelpin had detected a behavioral regression in
+        # their migration. No replay ran; nothing was compared. See ADR-0035.
+        #
+        # The final `else` reports the code instead of guessing at it: a code we do not
+        # recognise is exactly the case where inventing a meaning is most likely to be wrong.
         if [ "$MP_CODE" = "3" ]; then
           echo "::error::Modelpin could not measure at least one scenario migrating to '$MP_TO' - it is NOT cleared. See the PR comment / report."
-        else
+        elif [ "$MP_CODE" = "4" ]; then
+          echo "::error::Modelpin could not RUN for '$MP_TO' - a setup or configuration problem (often a missing API-key secret). No verdict was produced and nothing was measured. See this step's log for the error."
+        elif [ "$MP_CODE" = "1" ]; then
           echo "::error::Modelpin detected a behavioral regression migrating to '$MP_TO'. See the PR comment / report."
+        else
+          echo "::error::Modelpin exited with an unexpected code $MP_CODE migrating to '$MP_TO'. This is not a verdict. See this step's log."
         fi
         exit 1

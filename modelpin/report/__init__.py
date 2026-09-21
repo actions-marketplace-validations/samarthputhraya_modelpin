@@ -7,14 +7,16 @@ Matches the target UX in spec section 7. Framing stays measurement/opinion
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Optional
 
 from rich.markup import escape
 
 from modelpin.config import DEFAULT_RUNS
 from modelpin.models import DiffResult, DiffVerdict
+from modelpin.report.evidence import Example
 
 #: The run count the persisted artifact tells a reader to re-run at. [M] MP-117: the CLI's
 #: pre-spend warning said `Use --runs 5` while `last-report.md` -- the file `action.yml` posts,
@@ -41,15 +43,90 @@ _MD_MARK = {
 }
 
 
+#: Every character that can OPEN an inline Markdown construct, plus `\\` itself -- which
+#: must be escaped too, or an attacker's pre-escaped `\\[` becomes `\\\\[`: a literal
+#: backslash followed by a live `[`. One regex pass, so nothing is ever escaped twice.
+_MD_SPECIAL = re.compile(r"([\\`*\[\]<>&!#|~@])")
+
+
 def _md_inline(text: Any) -> str:
-    """Neutralize model-controlled text (scenario ids, tool names inside ``explanation``)
-    for safe inline use in the Markdown PR comment posted to GitHub: collapse newlines so it
-    can't break out of its line, drop HTML-comment markers (the sticky comment is found by
-    one), and escape pipes. Defends the PR comment against Markdown injection via a crafted
-    tool name in a model's response."""
-    s = str(text).replace("\r", "").replace("\n", " ")
-    s = s.replace("<!--", "<! --").replace("-->", "-- >")
-    return s.replace("|", "\\|").strip()
+    """Neutralize untrusted text for BARE inline use in a Markdown surface we publish.
+
+    MP-239. `[M] 2026-09-09` security review: this used to neutralize only BLOCK-level
+    structure -- newlines, HTML-comment markers, pipes -- and every inline construct passed
+    through. `[text](url)`, `![img]()`, `<img>`, `<a>`, `<details>` and emphasis all rendered
+    live, and the source is untrusted by construction: tool names in ``explanation`` come from
+    the MODEL, and ``cli.py`` records a live run in which the model hallucinated one. A tool
+    name of `escalate[Build passed - view logs](https://evil.example/phish)` rendered as a
+    masked link in the comment ``action.yml`` posts -- a forged CI banner, by our bot, in the
+    customer's pull request.
+
+    So: collapse newlines (no injected line can start a block), then backslash-escape every
+    character that can open an inline construct. CommonMark permits escaping any ASCII
+    punctuation and the escape is invisible once rendered, so benign text reads exactly as
+    before; `\\<` cannot open a tag, `\\[` cannot open a link, `\\&` cannot start an entity,
+    and `:` is escaped so a scheme cannot autolink. `www.` is broken separately because GFM
+    autolinks it without any punctuation this set could catch.
+
+    NOT for text that is already inside a code span -- escapes render literally there. Use
+    ``_md_code`` for those, which returns the whole span.
+    """
+    s = str(text).replace("\r", "").replace("\n", " ").strip()
+    s = _MD_SPECIAL.sub(r"\\\1", s)
+    # `_` opens or closes emphasis only at a word boundary. Flanked by alphanumerics on
+    # BOTH sides it is inert in CommonMark -- `[M]` `invoice_parse`, `tool_use_failed` and
+    # `a__b` all render without emphasis, while `_x_` and `__x__` do -- so escaping it there
+    # buys no safety and puts a backslash in every snake_case identifier a human reads raw.
+    s = re.sub(r"(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])", r"\\_", s)
+    # A scheme autolinks only as `scheme://`; a colon anywhere else (`coverage: ...`) is
+    # inert, and escaping it only obscured text.
+    s = re.sub(r":(?=//)", r"\\:", s)
+    return re.sub(r"(?i)\b(www)\.", r"\1\\.", s)
+
+
+def _md_code(text: Any, *, table: bool = False) -> str:
+    """Render an untrusted value as a COMPLETE inline code span that nothing can close.
+
+    MP-239. Call sites used to write `` `{value}` `` by hand, which is safe only while the
+    value holds no backtick: one backtick closes the span and everything after it is parsed
+    as live Markdown. CommonMark's own rule is used instead -- fence with one more backtick
+    than the longest run inside, and pad with a space when the value touches a backtick --
+    so the content is preserved exactly rather than having its backticks swapped for
+    something else. Inside a code span nothing is interpreted: no links, no raw HTML, no
+    emphasis, and GitHub does not autolink there.
+
+    ``table=True`` also escapes `|`. GFM splits a table row on an unescaped pipe BEFORE it
+    parses inline code, so a pipe inside a code span still ends the cell -- and the text after
+    it is then parsed as live Markdown.
+    """
+    s = str(text).replace("\r", "").replace("\n", " ").strip()
+    if table:
+        s = s.replace("|", "\\|")
+    longest = max((len(run) for run in re.findall(r"`+", s)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if (not s or s.startswith("`") or s.endswith("`")) else ""
+    return f"{fence}{pad}{s}{pad}{fence}"
+
+
+def _md_examples(
+    examples: Optional[Mapping[str, tuple[Example, Example]]], scenario_id: str
+) -> list[str]:
+    """A collapsed baseline-vs-candidate example under a flagged verdict.
+
+    Model output is untrusted text in a comment we post, so each side is a complete code span
+    (`_md_code`), inside which nothing renders as a link, image or HTML (MP-239).
+    """
+    pair = (examples or {}).get(scenario_id)
+    if not pair:
+        return []
+    return [
+        "<details><summary>example runs</summary>",
+        "",
+        f"- baseline: {_md_code(pair[0].describe())}",
+        f"- candidate: {_md_code(pair[1].describe())}",
+        "",
+        "</details>",
+    ]
 
 
 def _bucket(results: list[DiffResult]) -> dict[DiffVerdict, list[DiffResult]]:
@@ -153,6 +230,29 @@ class ChannelCensus:
     #: already followed, and following it is what turned "NOT cleared on content" into
     #: "looks safe to adopt" over a total content inversion.
     declared_unused_tools: tuple[str, ...] = ()
+    #: MP-194. The mirror of `declared_unused_tools`: compared scenarios whose RECORDED RUNS
+    #: called a tool that the scenario does not declare.
+    #:
+    #: `[M] 2026-09-06` This state is why the disclosure could print three false statements
+    #: directly beneath the verdict that contradicted them. With a scenario that omits `tools`
+    #: while its traces carry `tool_calls`, one run produced:
+    #:
+    #:     REGRESSION refund_gbp: tool-call behavior changed: ['escalate'] -> [] (0.99)
+    #:     coverage: inert this run -- tool trajectory + arguments (no scenario declares
+    #:     `tools`); ...; 1 of 1 scenario(s) called no tool, so no CI-failing channel could
+    #:     see a content change in them (refund_gbp)
+    #:
+    #: The tool channel is what fired; the baseline called `escalate` in 5 of 5 runs; and a
+    #: CI-failing channel had just seen the change. `_tool_live` requires BOTH a declaration
+    #: and a call, while the diff engine requires neither and reads tool calls straight off
+    #: the traces -- so the census and the verdict answered the same question two ways.
+    #:
+    #: The conjunction itself is NOT the bug and is deliberately left alone: an FP review
+    #: blocked testing `tool_active` alone precisely because it would GRANT clearances the
+    #: previous version withheld, and the conjunction is what keeps the blind set a superset
+    #: for every input. Conservatism is correct. Stating a falsehood to achieve it is not.
+    #: So these ids stay uncleared, and the disclosure stops claiming they called no tool.
+    undeclared_tool_calls: tuple[str, ...] = ()
 
     @property
     def hard_content_channels(self) -> list[str]:
@@ -178,13 +278,26 @@ class ChannelCensus:
             # MP-159. Two ways to be dead, and they take different remedies, so the
             # disclosure must not collapse them: nobody asked for the channel, or somebody
             # asked and no model ever called the tool.
-            why = (
-                f"{len(self.declared_unused_tools)} scenario(s) declare `tools` but no run "
-                f"called one"
-                if self.declared_unused_tools
-                else "no scenario declares `tools`"
-            )
-            out.append(f"tool trajectory + arguments ({why})")
+            #
+            # MP-194 adds a THIRD, and it is not a way of being dead at all: runs that called
+            # a tool the scenario never declared. `[M] 2026-09-06` calling that channel
+            # "inert" put a false statement directly above a `REGRESSION ... tool-call
+            # behavior changed` that the channel had just produced. The scenarios stay
+            # uncleared -- see `undeclared_tool_calls` for why that conservatism is right --
+            # but the word "inert" is retired for this case, because it is simply untrue.
+            if not self.undeclared_tool_calls:
+                why = (
+                    f"{len(self.declared_unused_tools)} scenario(s) declare `tools` but no "
+                    f"run called one"
+                    if self.declared_unused_tools
+                    else "no scenario declares `tools`"
+                )
+                out.append(f"tool trajectory + arguments ({why})")
+            # MP-194. When runs DID call an undeclared tool, the channel is simply not inert,
+            # so it is omitted from a list of inert channels rather than described inside one.
+            # What actually happened -- it fired, and we do not credit it as coverage -- is
+            # said once, by the per-scenario clause in `_census_note`. Saying it in both
+            # places was the first version of this fix and it read as two different findings.
         if not self.judge_enabled:
             out.append(f"semantic judge ({self.judge_off_reason})")
         if not self.assertions_declared:
@@ -228,7 +341,7 @@ def _census_clearance(
         return (
             f"{arrow} No behavioral regressions found in the {total - len(blind)} scenario(s) "
             f"where a CI-failing channel could see a change in content; in {len(blind)} no "
-            f"run called a tool, so none was live ({', '.join(blind)}) and `{to_model}` is "
+            f"run called a tool, so none was live ({', '.join(_md_code(b) for b in blind)}) and {_md_code(to_model)} is "
             f"only partially cleared. A wrong-but-confident answer in those would have passed."
         )
     # Fully blind -- either every compared scenario is in `blind`, or the caller supplied no
@@ -256,13 +369,21 @@ def _census_clearance(
         f"{arrow} This run had NO CI-failing channel able to see a change in what the model says: "
         f"{'; '.join(census.inert)}. Only refusal could have failed the build, and it only "
         f"fires if the candidate starts declining. A wrong-but-confident answer would have "
-        f"passed. `{to_model}` is NOT cleared on content -- {remedy} or "
+        f"passed. {_md_code(to_model)} is NOT cleared on content -- {remedy} or "
         f"read the advisory findings {findings}."
     )
 
 
-def _census_note(census: Optional[ChannelCensus]) -> str | None:
-    """One-line coverage disclosure printed beside every verdict, clean or not."""
+def _census_note(census: Optional[ChannelCensus], fmt: Callable[[str], str] = str) -> str | None:
+    """One-line coverage disclosure printed beside every verdict, clean or not.
+
+    MP-239. The note is TRUSTED Markdown -- its `tools` / `judge_model` code spans are ours --
+    with one untrusted ingredient: scenario ids, which the author controls. So ids go through
+    ``fmt`` at the point they enter the note, and the assembled note is never escaped again.
+    `[M] 2026-09-09` escaping the whole note instead turned our own `` `tools` `` into literal
+    backticks on every PR comment. ``fmt`` defaults to ``str`` because the console caller
+    passes the note through Rich's ``escape`` whole, where a Markdown span would be noise.
+    """
     if census is None:
         return None
     parts = []
@@ -274,11 +395,26 @@ def _census_note(census: Optional[ChannelCensus]) -> str | None:
     # -- 3 of 14 DECLARE them, and since MP-159 only the ones that CALL one count -- and has
     # no way to learn the other 11 or more were content-blind.
     if census.blind_scenarios and census.compared:
-        parts.append(
-            f"{len(census.blind_scenarios)} of {census.compared} scenario(s) called no "
-            f"tool, so no CI-failing channel could see a content change in them "
-            f"({', '.join(census.blind_scenarios)})"
-        )
+        # MP-194. Split by WHY a scenario is uncleared, because one sentence cannot be true
+        # of both. `[M] 2026-09-06` "called no tool, so no CI-failing channel could see a
+        # content change in them" was printed for a scenario whose baseline called `escalate`
+        # in 5 of 5 runs, three lines under the `REGRESSION ... tool-call behavior changed`
+        # that channel had just produced. Neither clause was true of it.
+        undeclared = set(census.undeclared_tool_calls)
+        silent = [s for s in census.blind_scenarios if s not in undeclared]
+        fired = [s for s in census.blind_scenarios if s in undeclared]
+        if silent:
+            parts.append(
+                f"{len(silent)} of {census.compared} scenario(s) called no "
+                f"tool, so no CI-failing channel could see a content change in them "
+                f"({', '.join(fmt(s) for s in silent)})"
+            )
+        if fired:
+            parts.append(
+                f"{len(fired)} of {census.compared} scenario(s) called a tool they do not "
+                f"declare, so their tool comparison ran but is not credited as coverage "
+                f"({', '.join(fmt(s) for s in fired)})"
+            )
     if not parts:
         return None
     return "coverage: " + "; ".join(parts)
@@ -304,7 +440,7 @@ _UNDERPOWERED_NOTE = (
 _MAX_NAMED_BLIND = 8
 
 
-def _named_blind(ids: Sequence[str], fmt: Callable[[str], str] = str) -> str:
+def _named_blind(ids: Sequence[str], fmt: Callable[[str], str] = _md_code) -> str:
     """`a, b, c` -- truncated with `and N more` past ``_MAX_NAMED_BLIND``."""
     shown = [fmt(sid) for sid in ids[:_MAX_NAMED_BLIND]]
     rest = len(ids) - len(shown)
@@ -321,10 +457,10 @@ def _rejected_clearance(
 ) -> str | None:
     if not rejected:
         return None
-    named = _named_blind([sid for sid, _ in rejected], lambda sid: f"`{sid}`")
+    named = _named_blind([sid for sid, _ in rejected])
     return (
         f"{arrow} {len(rejected)} scenario(s) were never replayed - the provider rejected "
-        f"them - so `{to_model}` is NOT fully cleared: {named}. A rejected scenario is not a "
+        f"them - so {_md_code(to_model)} is NOT fully cleared: {named}. A rejected scenario is not a "
         f"passing one; re-run, or fix what the provider named."
     )
 
@@ -356,10 +492,10 @@ def _skipped_clearance(
     """
     if not skipped:
         return None
-    named = _named_blind(skipped, fmt or (lambda sid: f"`{_md_inline(sid)}`"))
+    named = _named_blind(skipped, fmt or (lambda sid: f"{_md_code(sid)}"))
     return (
-        f"{arrow} {len(skipped)} scenario(s) had no recorded baseline for `{from_model}` and "
-        f"were never compared, so `{to_model}` is NOT fully cleared: {named}. An unmeasured "
+        f"{arrow} {len(skipped)} scenario(s) had no USABLE baseline for {_md_code(from_model)} — none recorded, or recorded against a different version of the scenario (MP-05) — and "
+        f"were never compared, so {_md_code(to_model)} is NOT fully cleared: {named}. An unmeasured "
         f"scenario is not a passing one; record a baseline to include it."
     )
 
@@ -389,13 +525,13 @@ def _underpowered_clearance(
     if len(underpowered) >= total:
         return (
             f"{arrow} This run could not have reported a regression at all: no signal could reach "
-            f"statistical significance at this run count. `{to_model}` is NOT cleared — "
+            f"statistical significance at this run count. {_md_code(to_model)} is NOT cleared — "
             f"{remedy}."
         )
     return (
         f"{arrow} No behavioral regressions found in the {total - len(underpowered)} scenario(s) "
         f"this run could measure; {len(underpowered)} could not have reported one at this "
-        f"run count, so `{to_model}` is only partially cleared — for the scenario(s) named "
+        f"run count, so {_md_code(to_model)} is only partially cleared — for the scenario(s) named "
         f"above, {remedy}."
     )
 
@@ -410,10 +546,19 @@ def render_pr_comment(
     census: Optional[ChannelCensus] = None,
     rejected: Sequence[tuple[str, str]] = (),
     skipped: Sequence[str] = (),
+    match_overrides: Optional[Mapping[str, str]] = None,
+    examples: Optional[Mapping[str, tuple[Example, Example]]] = None,
 ) -> str:
     """The Markdown PR comment (spec section 7). The header reflects the actual outcome —
     only a real regression leads with 🚨, so an all-unchanged result reads calm/green and
-    doesn't contradict its own "safe to adopt" line."""
+    doesn't contradict its own "safe to adopt" line.
+
+    ``match_overrides`` is ``{scenario_id: mode}`` for every scenario NOT compared under the
+    run's global ``--match`` (MP-227). `[M] 2026-09-08`, first-run review: without it, a
+    scenario could be given a LOOSER comparison relation and move from ``REGRESSION`` to
+    ``unchanged`` with no trace of it on this surface — and this surface is the one
+    ``action.yml`` posts, so it is the only thing most reviewers ever see. The console
+    printed the note and `action.yml` never reads the console."""
     _b = _bucket(results)
     regs = _b[DiffVerdict.regression]
     minors = _b[DiffVerdict.changed_minor]
@@ -425,26 +570,46 @@ def render_pr_comment(
         # and publishes "partially measured" over a run that measured NOTHING -- a stronger
         # claim than the evidence supports, on the line `action.yml` posts as the top of the
         # PR comment.
-        header = f"❔ **Modelpin: could not measure — `{from_model}` → `{to_model}`**"
+        header = (
+            f"❔ **Modelpin: could not measure — {_md_code(from_model)} → {_md_code(to_model)}**"
+        )
     elif regs:
-        header = f"\U0001f6a8 **Modelpin: behavioral regression — `{from_model}` → `{to_model}`**"
+        header = f"\U0001f6a8 **Modelpin: behavioral regression — {_md_code(from_model)} → {_md_code(to_model)}**"
     elif unmeasured:
         # Above `minors`: "we could not measure" outranks "we measured a small change",
         # because the unmeasured scenarios might hold anything at all.
-        header = f"❔ **Modelpin: could not measure — `{from_model}` → `{to_model}`**"
+        header = (
+            f"❔ **Modelpin: could not measure — {_md_code(from_model)} → {_md_code(to_model)}**"
+        )
     elif minors:
-        header = f"⚠️ **Modelpin: minor changes — `{from_model}` → `{to_model}`**"
-    elif (underpowered and len(underpowered) >= len(results)) or (
-        census is not None and not census.hard_content_channels
-    ):
+        header = f"⚠️ **Modelpin: minor changes — {_md_code(from_model)} → {_md_code(to_model)}**"
+    elif underpowered and len(underpowered) >= len(results):
         # (`rejected` is handled in the `partially measured` branch below: a run that
         # measured SOMETHING and lost a scenario is partial, not blind.)
         # A green check over a run that could not have gone red is the worst header we ship.
-        # MP-138 adds the second way to get there: every CI-failing channel that reads the
-        # model's CONTENT was inert, so no answer -- however wrong -- could have gone red.
-        # MP-116 fixed this exact contradiction for blind runs; shipping it again for inert
-        # channels would be the same defect with a new cause.
-        header = f"❔ **Modelpin: could not measure — `{from_model}` → `{to_model}`**"
+        # MP-116 fixed this exact contradiction for blind runs.
+        header = (
+            f"❔ **Modelpin: could not measure — {_md_code(from_model)} → {_md_code(to_model)}**"
+        )
+    elif census is not None and not census.hard_content_channels:
+        # MP-138's way of getting there: every CI-failing channel that reads the model's
+        # CONTENT was inert, so no answer -- however wrong -- could have gone red. The
+        # refusal to give a green check is unchanged and correct.
+        #
+        # MP-202: the WORDING is what changed. This branch used to reuse "could not measure",
+        # and `check --help` binds that exact phrase to EXIT 3 -- while this run exits **0**,
+        # because the scenarios were compared and nothing regressed. `[M] 2026-09-06` a PR
+        # therefore got a green check next to a comment headed "could not measure", and a
+        # reader who knows the documented contract cannot reconcile the two.
+        #
+        # The published Report has said the narrower, true thing here since MP-140 --
+        # "Incomplete: only a refusal would have registered as a regression" -- and that
+        # wording already survived a claims review that REJECTED a broader first draft. The
+        # PR comment now matches it, so the two surfaces stop describing one run two ways.
+        header = (
+            f"❔ **Modelpin: only a refusal could have failed this run — "
+            f"{_md_code(from_model)} → {_md_code(to_model)}**"
+        )
     elif underpowered or rejected or skipped:
         # MP-160 joins `skipped` for the same reason MP-148 joined `rejected`: a scenario
         # that was never compared makes the suite partial, whatever the compared ones said.
@@ -458,9 +623,13 @@ def render_pr_comment(
         # of the PR comment.
         # Reproduced end to end over a heterogeneous baseline (2 of 4 scenarios at 2 recorded
         # runs, checked at 4): line 1 read "no behavioral change" and the run exited 0.
-        header = f"❔ **Modelpin: partially measured — `{from_model}` → `{to_model}`**"
+        header = (
+            f"❔ **Modelpin: partially measured — {_md_code(from_model)} → {_md_code(to_model)}**"
+        )
     else:
-        header = f"✅ **Modelpin: no behavioral change — `{from_model}` → `{to_model}`**"
+        header = (
+            f"✅ **Modelpin: no behavioral change — {_md_code(from_model)} → {_md_code(to_model)}**"
+        )
     # MP-160. Two independent ways to lose a scenario, so this is composed rather than a
     # single `if/else` on one suffix. `[M]` The reviewer cannot otherwise detect the
     # shrinkage: this line published `Replayed N scenario(s)` with no denominator, so a suite
@@ -469,19 +638,31 @@ def render_pr_comment(
     if rejected:
         _gaps.append(f"{len(rejected)} could not be replayed at all")
     if skipped:
-        _gaps.append(f"{len(skipped)} scenario(s) had no baseline")
+        _gaps.append(f"{len(skipped)} scenario(s) had no usable baseline")
     lines = [
         header,
         f"Replayed {len(results)} scenario(s) ×{runs} runs {_provenance(provider)}"
         + ("; " + "; ".join(_gaps) + "." if _gaps else "."),
         "",
     ]
+    if match_overrides:
+        # Above every verdict bucket, for the same reason `rejected` is: this changes what
+        # the verdicts below MEAN. A looser relation on one scenario can turn a red build
+        # green, and a reviewer who cannot see that cannot review it.
+        lines.append(
+            f"**COMPARISON RELAXED OR CHANGED ({len(match_overrides)})** - these scenarios "
+            "declare their own tool-call `match` mode, so they were NOT compared under the "
+            "run's `--match`. A looser relation can turn a regression into `unchanged`."
+        )
+        for sid, mode in sorted(match_overrides.items()):
+            lines.append(f"⚙️ {_md_code(sid)} — compared under {_md_code(mode)}")
+        lines.append("")
     if rejected:
         # Before every verdict bucket: what was NOT measured changes how the measured
         # numbers should be read, so a reviewer must meet it first.
         lines.append(f"**COULD NOT REPLAY ({len(rejected)})** - excluded from every number below")
         for sid, reason in rejected:
-            lines.append(f"❗ `{_md_inline(sid)}` — {_md_inline(reason)}")
+            lines.append(f"❗ {_md_code(sid)} — {_md_inline(reason)}")
         lines.append("")
     if skipped:
         # MP-160, and this is the piece that carries the whole fix. It renders on EVERY run
@@ -490,10 +671,23 @@ def render_pr_comment(
         # this function both reach it only in the all-clean `else` branch, so a
         # clearance-shaped disclosure alone would be INERT on exactly the run a reviewer
         # most needs it -- a red verdict pronounced over a fraction of the suite.
-        lines.append(f"**NO BASELINE ({len(skipped)})** - never compared, and in no number below")
+        lines.append(
+            f"**NO USABLE BASELINE ({len(skipped)})** - never compared, and in no number "
+            "below. Either none was recorded, or the one on disk was recorded against a "
+            "different version of the scenario and would measure that edit, not the model "
+            "(MP-05)."
+        )
         for sid in skipped:
+            # `[M] 2026-09-07 first-run review` This line used to assert "no recorded baseline"
+            # for every id, flatly contradicting the header directly above it -- which lists
+            # three possible causes -- on the surface a PR reviewer actually reads, and with no
+            # self-correcting note anywhere below. It now states only what this renderer can
+            # actually know: the scenario was not compared. WHICH cause applies is on the
+            # console, with both fingerprints, and the header says the causes exist.
             lines.append(
-                f"❗ `{_md_inline(sid)}` — no recorded baseline for " f"`{_md_inline(from_model)}`"
+                f"❗ {_md_code(sid)} — not compared against "
+                f"{_md_code(from_model)} (see the run log for which of the causes above "
+                f"applies)"
             )
         lines.append("")
     if regs:
@@ -503,6 +697,7 @@ def render_pr_comment(
                 f"{_MD_MARK[r.verdict]} **{_md_inline(r.scenario_id)}** — {_md_inline(r.explanation)}"
             )
             lines.append(f"&nbsp;&nbsp;&nbsp;&nbsp;confidence {r.confidence:.2f}")
+            lines.extend(_md_examples(examples, r.scenario_id))
         lines.append("")
     if unmeasured:
         lines.append(f"**COULD NOT MEASURE ({len(unmeasured)})**")
@@ -510,6 +705,7 @@ def render_pr_comment(
             lines.append(
                 f"{_MD_MARK[r.verdict]} {_md_inline(r.scenario_id)} — {_md_inline(r.explanation)}"
             )
+            lines.extend(_md_examples(examples, r.scenario_id))
         lines.append("")
     if minors:
         lines.append(f"**MINOR CHANGES ({len(minors)})**")
@@ -517,6 +713,7 @@ def render_pr_comment(
             lines.append(
                 f"{_MD_MARK[r.verdict]} {_md_inline(r.scenario_id)} — {_md_inline(r.explanation)}"
             )
+            lines.extend(_md_examples(examples, r.scenario_id))
         lines.append("")
     _blind_set = set(underpowered)
     blind_ids = [r.scenario_id for r in unchanged if r.scenario_id in _blind_set]
@@ -537,7 +734,7 @@ def render_pr_comment(
         lines.append(
             f"**UNCHANGED ({len(unchanged)})** — ❔ {len(blind_ids)} of these could not have "
             f"reported a regression at this run count: "
-            + _named_blind(blind_ids, lambda sid: f"`{_md_inline(sid)}`")
+            + _named_blind(blind_ids, lambda sid: f"{_md_code(sid)}")
         )
     elif census is not None and not census.hard_content_channels:
         lines.append(
@@ -557,17 +754,25 @@ def render_pr_comment(
         # silence under a "could not measure" header reads like an omission rather than a
         # finding.
         lines.append(
-            f"→ Nothing was compared, so nothing is known about `{_md_inline(to_model)}`. "
+            f"→ Nothing was compared, so nothing is known about {_md_code(to_model)}. "
             f"This is NOT a clean result and NOT a regression -- it is the absence of a "
-            f"measurement. Record a baseline for `{_md_inline(from_model)}` and re-run."
+            f"measurement. Record a baseline for {_md_code(from_model)} and re-run."
         )
     elif regs or minors:
-        lines.append(f"→ Pin to `{from_model}` until resolved, or review the full diff above.")
+        lines.append(
+            f"→ Pin to {_md_code(from_model)} until resolved, or review the full diff above."
+            + (
+                ""
+                if regs
+                else " These are minor changes: they do not fail the build, so the decision "
+                "is yours."
+            )
+        )
     elif unmeasured:
         # MP-49 was exactly this line rendering over a run that measured nothing. "Safe to
         # adopt" must be reachable ONLY when every scenario produced a real comparison.
         lines.append(
-            f"→ {len(unmeasured)} scenario(s) could not be measured; `{to_model}` is NOT "
+            f"→ {len(unmeasured)} scenario(s) could not be measured; {_md_code(to_model)} is NOT "
             "cleared. Re-run, or inspect the provider responses."
         )
     else:
@@ -594,16 +799,16 @@ def render_pr_comment(
             lines.extend(weak)
             if weak
             else lines.append(
-                f"→ No behavioral regressions found; `{to_model}` looks safe to adopt."
+                f"→ No behavioral regressions found; {_md_code(to_model)} looks safe to adopt."
             )
         )
     # Coverage is disclosed on EVERY verdict, not only clean ones -- a red run whose
     # detectors were half off is just as misread as a green one (ADR-0022's rule, applied
     # to the number handed to the USER rather than to our own).
-    note = _census_note(census)
+    note = _census_note(census, fmt=_md_code)
     if note:
         lines.append("")
-        lines.append(f"<sub>{_md_inline(note)}</sub>")
+        lines.append(f"<sub>{note}</sub>")
     return "\n".join(lines)
 
 
@@ -616,6 +821,7 @@ def render_cli(
     census: Optional[ChannelCensus] = None,
     rejected: Sequence[tuple[str, str]] = (),
     skipped: Sequence[str] = (),
+    examples: Optional[Mapping[str, tuple[Example, Example]]] = None,
 ) -> str:
     """The CLI summary — ASCII text + rich color markup (safe on any console)."""
     _b = _bucket(results)
@@ -624,7 +830,11 @@ def render_cli(
     unchanged = _b[DiffVerdict.unchanged]
     unmeasured = _b[DiffVerdict.insufficient_evidence]
     lines = [
-        f"[bold]Modelpin[/]: {from_model} -> {to_model}  "
+        # MP-174. Model ids are user-supplied (`--to`/`--from`/`--model`) and reach a rich
+        # console, exactly like the scenario ids escaped throughout this function. An id
+        # containing `[/]` raised `MarkupError` on the FIRST line of the summary, after the
+        # report had already been written -- so CI published the artifact and then failed.
+        f"[bold]Modelpin[/]: {escape(from_model)} -> {escape(to_model)}  "
         f"[dim]({len(results)} scenario(s) x{runs} runs)[/]",
         "",
     ]
@@ -647,7 +857,7 @@ def render_cli(
         # `[/]` raised `MarkupError` and aborted the command AFTER the report had been
         # written -- CI publishing the artifact and then failing on a markup typo.
         lines.append(
-            f"[yellow]!![/] {len(skipped)} scenario(s) had no baseline, were never compared, "
+            f"[yellow]!![/] {len(skipped)} scenario(s) had no usable baseline, were never compared, "
             f"and are in NO number below:"
         )
         for sid in skipped:
@@ -666,6 +876,10 @@ def render_cli(
             f"{_CLI_MARK[r.verdict]} [bold]{escape(r.scenario_id)}[/]: "
             f"{escape(r.explanation)} [dim](confidence {r.confidence:.2f})[/]"
         )
+        pair = (examples or {}).get(r.scenario_id)
+        if pair:
+            lines.append(f"   [dim]baseline : {escape(pair[0].describe())}[/]")
+            lines.append(f"   [dim]candidate: {escape(pair[1].describe())}[/]")
     if unchanged:
         # MP-138. Same rule as the Markdown bucket: no green marker over a bucket that could
         # not have gone red. `[M]` The first cut guarded only the Markdown side, so the CLI --
@@ -700,7 +914,14 @@ def render_cli(
             lines.append(f"{ok_mark} [dim]{len(unchanged)} scenario(s) unchanged[/]")
     if regs or minors:
         lines.append("")
-        lines.append(f"[yellow]-> Pin to[/] [bold]{from_model}[/] until resolved.")
+        lines.append(f"[yellow]-> Pin to[/] [bold]{escape(from_model)}[/] until resolved.")
+        if not regs:
+            # A minors-only run exits 0. Without this line "Pin to ... until resolved" reads the
+            # same as a build-breaking regression (first-run review, 2026-09-15).
+            lines.append(
+                "[dim]   These are minor changes: they do not fail the build, so the decision "
+                "is yours.[/]"
+            )
         # ADR-0032, the interim it requires. `[M] 2026-08-29` the dogfood flagged 6 of 12
         # scenarios at confidence 1.00 -- all 6 confirmed TRUE positives by an independent
         # oracle -- printed "Pin to ... until resolved", and EXITED 0, because a violated
@@ -734,7 +955,7 @@ def render_cli(
                 _census_clearance(census, to_model, arrow="->"),
                 _rejected_clearance(rejected, to_model, arrow="->"),
                 _skipped_clearance(
-                    skipped, from_model, to_model, arrow="->", fmt=lambda sid: f"`{sid}`"
+                    skipped, from_model, to_model, arrow="->", fmt=lambda sid: f"{_md_code(sid)}"
                 ),
             )
             if x
@@ -808,6 +1029,21 @@ class ReportMeta:
     #: Scenario ids compared at a run count where NO signal could reach ALPHA (MP-55/MP-123).
     #: The run-count axis of the same disclosure; ``census`` prices channel availability.
     underpowered: list[str] = field(default_factory=list)
+    #: MP-227. ``scenario_id -> match mode`` for every scenario NOT diffed under
+    #: ``match_mode``, because it declared its own. Empty on every run where the global flag
+    #: governed everything, which is every run written before MP-227.
+    #:
+    #: This exists because ``match_mode`` alone became a FALSE claim the moment a scenario
+    #: could override it: the settings table publishes one mode over a run that used two, and
+    #: the Report is an ADR-0009 surface where "under these settings, we observed..." is the
+    #: whole framing. It rides on the meta for MP-140's reason -- ``to_report_sidecar``
+    #: serialises ``asdict(meta)``, so the Markdown and the JSON audit trail cannot disagree.
+    #:
+    #: `[M]` It also carries information the suite hash no longer does: ``compute_suite_hash``
+    #: excludes ``Scenario.match`` so that declaring it does not invalidate a paid-for
+    #: baseline (see that function), which means two runs differing only in a declaration
+    #: share a hash. This field is what keeps the Report reproducible across that exclusion.
+    match_overrides: dict[str, str] = field(default_factory=dict)
 
 
 def _fmt(value: Optional[float], spec: str, *, none: str = "—") -> str:
@@ -816,8 +1052,31 @@ def _fmt(value: Optional[float], spec: str, *, none: str = "—") -> str:
 
 
 def _cell(text: Any) -> str:
-    """Escape a value so it is safe inside a Markdown table cell."""
-    return str(text).replace("|", "\\|").replace("\r", "").replace("\n", " ").strip()
+    """Escape an untrusted value for BARE use inside a Markdown table cell.
+
+    MP-239: this escaped pipes and newlines and nothing else, so a cell was a live inline
+    context. It is now `_md_inline`, whose special set already includes `|`. For a value
+    that belongs inside a code span in a cell, use ``_md_code(value, table=True)``.
+    """
+    return _md_inline(text)
+
+
+def _match_override_cell(meta: ReportMeta) -> str:
+    """The `, except <id> (<mode>)` tail of the settings table's match-mode row (MP-227).
+
+    Empty when nothing overrode the global flag, so an ordinary Report is byte-identical to
+    the one this repo published before per-scenario `match` existed. When something DID
+    override it, every id is named: a Report that said `strict` while three scenarios ran
+    `subset` would be a false statement about the settings a public measurement was taken
+    under, which is the one thing ADR-0009's framing cannot survive.
+    """
+    if not meta.match_overrides:
+        return ""
+    named = ", ".join(
+        f"{_md_code(sid, table=True)} ({_md_code(mode, table=True)})"
+        for sid, mode in sorted(meta.match_overrides.items())
+    )
+    return f", except {named}"
 
 
 def _report_header(meta: ReportMeta, results: list[DiffResult]) -> list[str]:
@@ -829,11 +1088,11 @@ def _report_header(meta: ReportMeta, results: list[DiffResult]) -> list[str]:
     unmeasured = _b[DiffVerdict.insufficient_evidence]
     same_model = meta.reference_model == meta.candidate_model
     if same_model:
-        title = f"# Modelpin Report — baseline characterization of `{meta.candidate_model}`"
-        compare = f"`{meta.candidate_model}` against itself"
+        title = f"# Modelpin Report — baseline characterization of {_md_code(meta.candidate_model)}"
+        compare = f"{_md_code(meta.candidate_model)} against itself"
     else:
-        title = f"# Modelpin Report — `{meta.candidate_model}` vs `{meta.reference_model}`"
-        compare = f"`{meta.candidate_model}` against `{meta.reference_model}`"
+        title = f"# Modelpin Report — {_md_code(meta.candidate_model)} vs {_md_code(meta.reference_model)}"
+        compare = f"{_md_code(meta.candidate_model)} against {_md_code(meta.reference_model)}"
 
     if regs:
         glyph, head = "🚨", "Behavioral regressions found."
@@ -1034,17 +1293,24 @@ def _report_settings(meta: ReportMeta, n_scenarios: int) -> list[str]:
         "",
         "| Setting | Value |",
         "|---|---|",
-        f"| Suite | `{meta.suite_id}` v{meta.suite_version} (`{meta.suite_hash}`) |",
+        # MP-174. Every VALUE here is user-supplied -- model ids come from `--to`/`--from`,
+        # the suite fields from the caller's manifest -- and a raw `|` in any of them adds a
+        # cell and breaks the row. `[M] 2026-09-06`: with `--to 'm2|evil'` the two model rows
+        # carried 4 pipes where every other row carried 3, corrupting the settings table of
+        # the PUBLIC Report, which is an ADR-0009 surface. `_cell` on all of them rather than
+        # on the two that were reported: the next id to arrive here is as untrusted as these.
+        f"| Suite | {_md_code(meta.suite_id, table=True)} v{_cell(meta.suite_version)} "
+        f"({_md_code(meta.suite_hash, table=True)}) |",
         f"| Scenarios | {n_scenarios} |",
-        f"| Candidate model | `{meta.candidate_model}` |",
-        f"| Reference model | `{meta.reference_model}` |",
-        f"| Provider | `{meta.provider}` |",
+        f"| Candidate model | {_md_code(meta.candidate_model, table=True)} |",
+        f"| Reference model | {_md_code(meta.reference_model, table=True)} |",
+        f"| Provider | {_md_code(meta.provider, table=True)} |",
         f"| Runs per scenario | {meta.runs} |",
-        f"| Tool-call match mode | `{meta.match_mode}` |",
-        f"| Semantic judge | `{meta.judge_model}` |",
+        f"| Tool-call match mode | {_md_code(meta.match_mode, table=True)}{_match_override_cell(meta)} |",
+        f"| Semantic judge | {_md_code(meta.judge_model, table=True)} |",
         f"| Decision thresholds | {thresholds} |",
-        f"| Engine version | modelpin {meta.modelpin_version} |",
-        f"| Generated | {meta.date_iso} |",
+        f"| Engine version | modelpin {_cell(meta.modelpin_version)} |",
+        f"| Generated | {_cell(meta.date_iso)} |",
     ]
 
 
@@ -1056,7 +1322,16 @@ def _report_methodology(meta: ReportMeta) -> list[str]:
         "own API key. A verdict comes from the *distribution* of runs, not a single sample: "
         f"a two-sample permutation test (p ≤ {meta.diff_thresholds['alpha']}) gated by a "
         "minimum effect size. We compare five behavioral signals — tool-call trajectory match "
-        f"({meta.match_mode}), tool-call ARGUMENT match, refusal-rate change, output-format / "
+        # MP-227: name the global mode AND say that it was not universal, so this sentence
+        # cannot be read as a claim about every scenario. The ids themselves are in the
+        # settings table directly above rather than repeated into a prose paragraph.
+        f"({_md_inline(meta.match_mode)}"
+        + (
+            ", except where a scenario declares its own — see the settings table above"
+            if meta.match_overrides
+            else ""
+        )
+        + "), tool-call ARGUMENT match, refusal-rate change, output-format / "
         "assertion drift, and (when a judge runs) calibrated LLM-as-judge semantic "
         "equivalence. The argument signal is **advisory**: its effect-size floor is not yet "
         "calibrated on a labelled set, so it can raise a scenario to *minor* but never to a "
@@ -1132,7 +1407,7 @@ def render_report_md(results: list[DiffResult], meta: ReportMeta) -> str:
             "",
             "These scenario(s) errored during replay and are excluded from the counts above "
             '(disclosed so an omission is never read as "unchanged"): '
-            f"{', '.join(meta.skipped)}.",
+            f"{', '.join(_md_code(s) for s in meta.skipped)}.",
         ]
 
     sections += [
@@ -1159,8 +1434,8 @@ def render_report_md(results: list[DiffResult], meta: ReportMeta) -> str:
         "",
         "---",
         "",
-        f"Open suite: `{meta.suite_path}` ({meta.suite_id} v{meta.suite_version}, "
-        f"`{meta.suite_hash}`). A machine-readable JSON sidecar with the raw per-scenario "
+        f"Open suite: {_md_code(meta.suite_path)} ({_md_inline(meta.suite_id)} v{_md_inline(meta.suite_version)}, "
+        f"{_md_code(meta.suite_hash)}). A machine-readable JSON sidecar with the raw per-scenario "
         "results is written alongside this report. Harness + scenarios are open source under "
         "Apache-2.0. Method & false-positive measurement: [`docs/fp-measurement.md`](https://github.com/samarthputhraya/modelpin/blob/main/docs/fp-measurement.md).",
     ]

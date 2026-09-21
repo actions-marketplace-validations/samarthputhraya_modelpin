@@ -42,10 +42,17 @@ def test_baseline_with_gemini_signature_bytes_persists(tmp_path):
             }
         ],
     )
-    save_baseline({"s1": [trace]}, "gemini-3.1-flash-lite", tmp_path)
+    # The guarantee this test exists for is the one in its first comment: persisting must not
+    # CRASH. `[M] 2026-09-09` MP-240 strengthened how it holds. The bytes used to be
+    # base64-encoded on the way to disk; now `messages` is not persisted at all, because the
+    # diff never reads it and this is the file users are told to commit. So the signature
+    # never reaches the serializer -- which cannot crash on what it is never handed.
+    path = save_baseline({"s1": [trace]}, "gemini-3.1-flash-lite", tmp_path)
+    raw = path.read_text(encoding="utf-8")
+    assert "thought_signature" not in raw, "the opaque signature reached the committed file"
+    assert base64.b64encode(sig).decode("ascii") not in raw
     loaded = load_baseline("gemini-3.1-flash-lite", tmp_path)
-    stored = loaded["s1"][0].messages[0]["parts"][0]["thought_signature"]
-    assert base64.b64decode(stored) == sig  # round-trips losslessly (base64 on disk)
+    assert loaded["s1"][0].messages == [], "a loaded baseline carries no transcript"
     # the in-memory live object keeps the raw bytes — SDK feed-back is unaffected
     assert trace.messages[0]["parts"][0]["thought_signature"] == sig
 
@@ -67,13 +74,20 @@ def test_failed_save_leaves_prior_baseline_intact(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(os, "replace", _boom)
-    with pytest.raises(OSError):
+    # MP-197. `BaselineError`, not the raw `OSError` this asserted before: an unwritable store
+    # used to reach the user as an unhandled traceback. The typed error is what lets `baseline`
+    # print a message and exit EXIT_SETUP_FAILED. The property this test exists for -- the
+    # PRIOR baseline survives a failed write -- is unchanged and still asserted below.
+    with pytest.raises(BaselineError, match="could not write the baseline"):
         save_baseline(_traces(), "gpt-4o-mini", tmp_path)
     monkeypatch.setattr(os, "replace", real_replace)
 
     # the original baseline is still loadable and uncorrupted
     loaded = load_baseline("gpt-4o-mini", tmp_path)
     assert len(loaded["s1"]) == 3
+    # MP-197. And the failed write leaves nothing behind in the directory the docs tell the
+    # user to `git add`.
+    assert not list(tmp_path.rglob("*.tmp"))
 
 
 def test_model_id_with_slashes_is_sanitized(tmp_path):
@@ -95,3 +109,34 @@ def test_corrupt_baseline_raises_baseline_error(tmp_path):
     path.write_text("{ this is not valid json")
     with pytest.raises(BaselineError, match="corrupt"):
         load_baseline("gpt-4o-mini", tmp_path)
+
+
+def test_the_store_ignores_everything_but_baselines(tmp_path):
+    """Only baselines are meant to be committed; reports and run archives are per-run output."""
+    import subprocess
+
+    from modelpin.storage import STORE_GITIGNORE
+
+    store = tmp_path / ".modelpin"
+    save_baseline({"s": [Trace(scenario_id="s", model_id="m", final_output="x")]}, "m", store)
+    assert (store / ".gitignore").read_text(encoding="utf-8") == STORE_GITIGNORE
+    (store / "last-report.md").write_text("r", encoding="utf-8")
+    (store / "runs").mkdir()
+    (store / "runs" / "check.md").write_text("r", encoding="utf-8")
+    if subprocess.run(["git", "init", "-q", str(tmp_path)], capture_output=True).returncode:
+        return  # git unavailable; the file content is asserted above
+    ignored = subprocess.run(
+        ["git", "-C", str(tmp_path), "check-ignore", "--no-index",
+         ".modelpin/last-report.md", ".modelpin/runs/check.md", ".modelpin/baseline-m.json"],
+        capture_output=True, text=True,
+    ).stdout  # fmt: skip
+    assert "last-report.md" in ignored and "runs/check.md" in ignored
+    assert "baseline-m.json" not in ignored
+
+
+def test_an_existing_store_gitignore_is_never_overwritten(tmp_path):
+    store = tmp_path / ".modelpin"
+    store.mkdir()
+    (store / ".gitignore").write_text("mine\n", encoding="utf-8")
+    save_baseline({"s": [Trace(scenario_id="s", model_id="m", final_output="x")]}, "m", store)
+    assert (store / ".gitignore").read_text(encoding="utf-8") == "mine\n"

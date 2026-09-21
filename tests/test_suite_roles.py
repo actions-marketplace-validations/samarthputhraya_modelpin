@@ -106,6 +106,49 @@ KNOWN_ROLES = {"fit", "score", "public", "fixture"}
 #: way, and a scenario from the only surface an argument false positive can appear on became
 #: declared fittable with zero test friction.
 EXPECTED_MEMBERS: dict[tuple[str, str], frozenset[str]] = {
+    # MP-224 / ADR-0041. The labelled tool-trajectory set: a structural rule for the tool
+    # NAME channel may be chosen here, and no rate may ever be published from here. It is
+    # the set ADR-0002's revisit bar asks for and `[M]` the repo did not have -- 4 distinct
+    # detection scenarios replayed 20 times is n_eff 4, not 10.
+    ("calibration/tool", "fit"): frozenset(
+        {
+            "tc_anchor_deeds_office_lookup",
+            "tc_anchor_ferry_book_two_step",
+            "tc_archive_two_box_request",
+            "tc_bakery_standing_delivery",
+            "tc_beekeeping_backorder_lookup",
+            "tc_boxoffice_seat_move",
+            "tc_brewery_keg_credit",
+            "tc_campsite_pitch_hold",
+            "tc_carwash_plan_change",
+            "tc_cheese_delivery_route",
+            "tc_cidermill_reminder_channel",
+            "tc_cleaning_rate_uplift",
+            "tc_climbinggym_freeze_refund",
+            "tc_courier_locker_reassign",
+            "tc_dentallab_case_setup",
+            "tc_filmkit_lens_swap",
+            "tc_glazier_survey_check",
+            "tc_kennel_boarding_clearance",
+            "tc_laundry_route_shortfall",
+            "tc_locksmith_charge_guard",
+            "tc_marina_berth_assign",
+            "tc_nursery_batch_move",
+            "tc_parking_permit_renew",
+            "tc_planthire_offhire_collection",
+            "tc_sailmaker_cloth_check",
+            "tc_scaffold_dismantle_check",
+            "tc_schoolbus_cover_route",
+            "tc_signshop_price_route",
+            "tc_skihire_boot_swap",
+            "tc_solar_meter_swap",
+            "tc_tailoring_consent_log",
+            "tc_taxifleet_service_booking",
+            "tc_toollib_return_and_fee",
+            "tc_upholstery_fabric_hold",
+            "tc_windfarm_workorder",
+        }
+    ),
     # The held-out DoD suite -- the north-star false-positive rate is measured here.
     ("suite", "score"): frozenset(
         {
@@ -172,6 +215,20 @@ EXPECTED_MEMBERS: dict[tuple[str, str], frozenset[str]] = {
             "refuse_send_email",
         }
     ),
+    # MP-178. VoiceRAG's calibrated abstention -- `score`, so the published run may be
+    # measured here and NO assertion may be re-cut afterwards to change it (ADR-0025).
+    ("voicerag-suite", "score"): frozenset(
+        {
+            "abstain_empty_context",
+            "abstain_topic_no_answer",
+            "abstain_unsafe_question",
+            "answer_multi_hop",
+            "answer_over_distractor",
+            "answer_paraphrase_gap",
+            "cite_in_range",
+            "format_one_spoken_sentence",
+        }
+    ),
     ("drift-suite", "fixture"): frozenset(
         {
             "ambiguous_tool_redundant",
@@ -186,6 +243,64 @@ EXPECTED_MEMBERS: dict[tuple[str, str], frozenset[str]] = {
             "sarcasm_sentiment",
             "strict_json_escape",
             "tool_missing_param",
+        }
+    ),
+    # MP-205: the false-positive suite of record, temperature 1.0, pre-registered in ADR-0036.
+    # A scenario here can never be fitted on or edited after scoring; moving one needs an ADR.
+    ("fp-suite", "score"): frozenset(
+        {
+            "agent_missing_param_ask",
+            "agent_reschedule_two_step",
+            "borderline_medication_question",
+            "classify_review_sentiment",
+            "extract_invoice_fields",
+            "format_markdown_table",
+            "rag_answer_with_citation",
+            "rewrite_email_polite",
+            "sql_from_question",
+            "summarize_standup_notes",
+            "support_order_status",
+            "triage_ticket_json",
+        }
+    ),
+    # MP-207: the channel-exposure set, pre-registered in ADR-0038. Same role and the same
+    # no-edit-after-scoring rule as fp-suite, and deliberately NOT a copy of it: these
+    # scenarios exist because [M] 0 of 710 same-model-null trials ever moved the tool or
+    # assertion channel, so the bound covered neither.
+    ("fp-suite-v2", "score"): frozenset(
+        {
+            "anchor_mandatory_lookup_fixed_format",
+            "calc_tool_or_mental_math",
+            "citation_style_underspecified",
+            "docsearch_or_general_knowledge",
+            "grammar_tool_or_direct_fix",
+            "optional_availability_before_booking",
+            "optional_notify_after_status_update",
+            "optional_part_stock_second_lookup",
+            "plaintext_answer_bold_optional",
+            "sql_answer_fence_unspecified",
+            "total_currency_code_or_symbol",
+            "verify_or_trust_pasted_status",
+        }
+    ),
+    # MP-222: attempt #2 at the ASSERTION channel alone, after fp-suite-v2 failed on it and
+    # published the failure. [M] The v2 traces show the models were never deterministic --
+    # three of its four assertions simply named a literal outside the output distribution
+    # (`[2]` in 0/400 runs against `Passage 2` in 400/400). These ten declare no tools, so
+    # the assertion channel is the only one they are built to move. Same no-edit-after-
+    # scoring rule as fp-suite and fp-suite-v2; moving one needs an ADR.
+    ("fp-suite-v3", "score"): frozenset(
+        {
+            "action_items_keep_the_owners",
+            "anchor_closed_set_label",
+            "anchor_echo_the_reference_line",
+            "dispatch_line_keeps_the_ids",
+            "handover_note_keeps_the_ids",
+            "json_null_or_omitted_key",
+            "metrics_line_keeps_the_numbers",
+            "regex_anchors_unspecified",
+            "slug_conjunction_stopwords",
+            "standup_digest_keeps_the_ids",
         }
     ),
 }

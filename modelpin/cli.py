@@ -11,14 +11,18 @@ Replays use the END USER's API key from the environment (BYO-key, spec section 9
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shlex
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Sequence, Set as AbstractSet
-from typing import NoReturn, Optional
+from collections.abc import Mapping, Sequence, Set as AbstractSet
+from typing import IO, Any, NoReturn, Optional, cast
 
 import typer
+from pydantic import ValidationError
 from rich.box import ASCII as ASCII_BOX
 from rich.console import Console
 from rich.markup import escape as _rich_escape
@@ -27,6 +31,7 @@ from rich.text import Text
 
 from modelpin import __version__
 from modelpin.config import (
+    DEFAULT_CONFIG_FILE,
     DEFAULT_PROVIDER,
     DEFAULT_RUNS,
     ConfigError,
@@ -34,8 +39,15 @@ from modelpin.config import (
     load_config,
 )
 from modelpin.demo import DEMO_DIRNAME, DEMO_FIXTURES, DEMO_TO, write_demo
-from modelpin.detector import scan_repo
+from modelpin.detector import (
+    DEFAULT_EXTS,
+    ENV_TEMPLATE_NAMES,
+    MAX_SCAN_BYTES,
+    ScanRefusedError,
+    scan_repo,
+)
 from modelpin.diff import (
+    MatchMode,
     ALPHA,
     EQUIVALENCE_MODES,
     MIN_REFUSAL_DELTA,
@@ -44,13 +56,15 @@ from modelpin.diff import (
     MIN_TOOL_TVD,
     diff_scenario,
 )
+from modelpin.diff.confirm import confirm_regression
 from modelpin.diff.stats import (
     min_achievable_pvalue_distribution,
     min_achievable_pvalue_mean,
 )
-from modelpin.models import Assertion, DiffResult, DiffVerdict, Scenario, Trace
+from modelpin.models import MATCH_MODES, Assertion, DiffResult, DiffVerdict, Scenario, Trace
 from modelpin.providers import ProviderAdapter, ProviderError, get_adapter, provider_help
 from modelpin.providers.fake import FakeProvider
+from modelpin.providers.openai import MAX_TOOL_TURNS
 from modelpin.replay import replay
 from modelpin.report import (
     ChannelCensus,
@@ -60,15 +74,34 @@ from modelpin.report import (
     render_report_md,
     to_report_sidecar,
 )
-from modelpin.report.suite import compute_suite_hash, read_manifest, slug
+from modelpin.report.evidence import Example, pick_examples
+from modelpin.report.suite import (
+    compute_suite_hash,
+    read_manifest,
+    scenario_fingerprint,
+    slug,
+)
 from modelpin.scenarios import _RESERVED_FILES as _RESERVED_IN_DIR
 from modelpin.scenarios import ScenarioError, load_scenarios, unrecognised_assertion_keys
+from modelpin.scaffold import (
+    CREDENTIAL_HINT,
+    has_credentials,
+    infer_setup,
+    render_config,
+    sdk_installed,
+)
+from modelpin.scenarios.starter import AGENT_STARTER_FILENAME, write_agent_starter
 from modelpin.storage import (
     STORE_DIRNAME,
+    ensure_store,
     BaselineError,
     load_baseline,
+    load_baseline_fingerprints,
     nonuniform_run_counts,
+    degenerate_scenarios,
     save_baseline,
+    secret_bearing_scenarios,
+    stale_scenarios,
 )
 
 #: A behavioral diff compares run *distributions*; fewer than this can't form one.
@@ -77,13 +110,30 @@ MIN_RUNS = 2
 #: from 1 (a real regression) so a caller can tell "it broke" from "we could not tell", and
 #: distinct from 2, which Click already returns for a usage error. See ADR-0018.
 EXIT_UNMEASURED = 3
+#: Exit code when Modelpin produced NO VERDICT AT ALL: a setup, configuration or environment
+#: failure. Everything that reaches `_fail`. See ADR-0035.
+#:
+#: `[M] 2026-09-06` These used to exit **1**, the code `check --help` documents as "at least one
+#: real regression (the CI gate)" and `action.yml:167-181` publishes as
+#: `::error::Modelpin detected a behavioral regression`. So a contributor who forgot to add
+#: `OPENAI_API_KEY` to repository secrets got a GitHub annotation asserting that their model
+#: migration regressed -- with no replay run and no scenario compared. Reproduced:
+#: `mp baseline` with no key exported, and `mp check --match nonsense`, both EXIT=1.
+#:
+#: Distinct from 3 on purpose. Exit 3 is an ABSTENTION from a run that really happened
+#: (ADR-0018); this is the absence of a run. Collapsing them would make "not cleared"
+#: ambiguous between "we looked and could not tell" and "we never looked".
+EXIT_SETUP_FAILED = 4
 #: Below this, the permutation test is underpowered — warn but proceed. Derived from the
 #: config default so the number a user is warned about and the number they get by default
 #: can never disagree; three copies of it drifting apart is exactly what MP-03 was.
 RECOMMENDED_RUNS = DEFAULT_RUNS
 #: Tool-call trajectory match modes accepted by `--match` (validated at the CLI boundary
-#: so an unknown mode fails friendly here rather than deep in the diff engine).
-VALID_MATCH_MODES = ("strict", "unordered", "subset", "superset")
+#: so an unknown mode fails friendly here rather than deep in the diff engine). Aliased from
+#: `models.MATCH_MODES` rather than re-listed: MP-227 gave the same four names a third home
+#: (`Scenario.match`), and three hand-maintained copies of one list is exactly the drift MP-03
+#: and MP-204 each cost a session to unpick.
+VALID_MATCH_MODES = MATCH_MODES
 
 app = typer.Typer(
     help="Modelpin - Dependabot for AI models. Know before the model breaks you.",
@@ -91,31 +141,96 @@ app = typer.Typer(
     add_completion=False,
     rich_markup_mode=None,  # plain Click help: ASCII-only, never crashes on cp1252
 )
-console = Console()
 
+
+class _EncodingSafeStdout:
+    """``sys.stdout``, resolved at write time, that can never raise ``UnicodeEncodeError``.
+
+    MP-191. The console is not allowed to decide the exit code. `cli.py` documents ``1`` as
+    "at least one real regression (the CI gate)" and ``action.yml:167-181`` turns any
+    non-zero, non-3 code into ``::error::Modelpin detected a behavioral regression`` -- so an
+    id outside the console's codepage used to post a false regression claim on someone's PR
+    over a migration that did not regress. `[M] 2026-09-06`, reproduced end to end over
+    BYTE-IDENTICAL traces: exit 1, while the report written moments earlier said
+    ``**UNCHANGED (1)**``.
+
+    `[M]` PR #73 did not cause this, it UNCOVERED it: before ``utf-8-sig`` the same fixtures
+    file died earlier, at *read*. MP-190 fixed text going INTO the engine; this is the same
+    class coming OUT of it, and the two are one defect seen from both ends.
+
+    `[M]` The blast radius is also wider than one line. rich clears its buffer *before*
+    writing it, so when the write raised, the un-written text stayed queued and re-raised on
+    the NEXT print: one unencodable id poisoned every subsequent line, including lines that
+    were pure ASCII. Reproduced in `tests/test_console_safety.py` -- an ASCII control failed
+    only when it ran after an unencodable print.
+
+    Three properties, in the order they matter:
+
+    1. **It never raises.** Degrade the text, print it, keep the verdict's own exit code.
+    2. **It degrades only when it must.** The stream is asked whether it can take the text
+       before anything is rewritten, so a modern UTF-8 terminal -- almost every user -- keeps
+       ids verbatim. Sanitising unconditionally would mangle output for everyone to protect a
+       minority, and is guarded against by a test.
+    3. **It resolves ``sys.stdout`` per write** rather than capturing it at import. Typer's
+       ``CliRunner`` and pytest's capture both replace the stream after this module loads; a
+       captured handle would silently write past them.
+
+    ``backslashreplace``, not ``replace``: ``\\u554f\\u3044`` still identifies WHICH scenario
+    regressed, where ``?????`` does not. This is a diagnostic tool -- a degraded id the user
+    can look up beats a row of question marks.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        # Deliberately not a stored handle: see property 3 above. AttributeError propagates,
+        # which is what lets rich's `getattr(file, "rich_proxied_file", file)` fall back.
+        return getattr(sys.stdout, name)
+
+    def write(self, text: str) -> int:
+        stream = sys.stdout
+        encoding = getattr(stream, "encoding", None)
+        if encoding:
+            try:
+                text.encode(encoding)
+            except UnicodeEncodeError:
+                text = text.encode(encoding, "backslashreplace").decode(encoding, "replace")
+        return stream.write(text)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+
+# `cast`, not `# type: ignore`: this IS a deliberate duck-typed proxy, and saying so in
+# the type system is more honest than suppressing the complaint. rich only ever calls
+# `.write()`, `.flush()` and stream predicates on it, all of which are provided or
+# forwarded -- the full `IO[str]` protocol is not implemented and is not needed.
+console = Console(file=cast(IO[str], _EncodingSafeStdout()))
+
+# A literal, unlike the agent starter in `scenarios/starter.py`, which is built from a real
+# `Scenario` object: this is the file a stranger reads first, so its bytes are hand-laid-out.
+#
+# A small classifier rather than "say hello". `[M] 2026-09-15` live on Gemini, "Say hello in
+# one short sentence." came back as "Hi there!" and "Hello there!" -- and `must_contain` is
+# case-sensitive, so the old starter's own assertion failed on most runs of most models. A
+# starter whose check is flaky teaches the wrong lesson on the first run. This one asks for a
+# constrained answer the assertion can actually hold the model to.
+_SAMPLE_SCENARIO_FILENAME = "sentiment.json"
 _SAMPLE_SCENARIO = """{
-  "id": "greeting",
-  "name": "Simple greeting",
+  "id": "sentiment",
+  "name": "Classify the sentiment of a customer message",
   "kind": "single",
-  "input": {"messages": [{"role": "user", "content": "Say hello in one short sentence."}]},
-  "assertions": {"must_contain": ["hello"]}
+  "input": {
+    "messages": [
+      {"role": "system", "content": "Classify the sentiment of the user's message. Answer with exactly one lowercase word: positive, negative, or neutral."},
+      {"role": "user", "content": "The new update made the app so much faster, thank you!"}
+    ]
+  },
+  "assertions": {"must_contain": ["positive"], "must_not_contain": ["negative"]}
 }
 """
 
-# The scaffolded `runs:` is interpolated from DEFAULT_RUNS, not typed literally: the
-# scaffold, the config default and the CLI warning were three copies of one number that
-# drifted apart, which IS MP-03.
-_SAMPLE_CONFIG = f"""# modelpin.yaml - generated by `modelpin init`. See docs/ for the full reference.
-models:
-  - gpt-4o-mini            # the model your app currently depends on (set yours)
-scenarios_dir: scenarios
-providers:
-  - openai                 # uses YOUR OPENAI_API_KEY from the environment
-runs: {DEFAULT_RUNS}                    # N replays per scenario; below 4 the tool signal cannot fire
-judge_model: gpt-4o-mini   # semantic LLM-judge (optional; extra calls). Remove to disable.
-# judge_provider: groq    # only needed when the judge model id does not name its own
-#                         # vendor: gpt-* and gemini-* do, qwen/qwen3.8-27b does not.
-"""
+# What `modelpin init` writes when it can see nothing: no model in the code and no credentials
+# in the environment. The live scaffold is chosen per repo by `modelpin.scaffold.infer_setup`.
+_SAMPLE_CONFIG = render_config(infer_setup([], env={}))
 
 
 def _fail(message: str) -> NoReturn:
@@ -144,7 +259,11 @@ def _fail(message: str) -> NoReturn:
     intentional markup.
     """
     console.print(f"[red]error:[/] {_rich_escape(message)}")
-    raise typer.Exit(code=1)
+    # ADR-0035. `EXIT_SETUP_FAILED`, not 1: every one of these call sites is a setup,
+    # configuration or environment failure -- surveyed, all 28 -- and none is a measurement.
+    # Exiting 1 made `action.yml` publish "Modelpin detected a behavioral regression" over a
+    # run that never happened.
+    raise typer.Exit(code=EXIT_SETUP_FAILED)
 
 
 def _adapter(provider: str, fixtures: Optional[str]) -> ProviderAdapter:
@@ -154,6 +273,12 @@ def _adapter(provider: str, fixtures: Optional[str]) -> ProviderAdapter:
         return get_adapter(provider)
     except FileNotFoundError as exc:
         _fail(f"fixtures file not found: {exc}")
+    except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+        # A malformed fixtures file raised a raw traceback (first-run review, 2026-09-15).
+        _fail(
+            f"fixtures file {fixtures} is not a JSON array of trace objects "
+            f"({type(exc).__name__}). `modelpin init --demo` writes an example traces.json."
+        )
     except ValueError as exc:  # unknown provider
         _fail(str(exc))
 
@@ -183,6 +308,18 @@ def _guard_replay(provider: str, fn):
         _fail(str(exc))
 
 
+def _progress(done: int, total: int, scenario_id: str, provider: str) -> None:
+    """One dim line as each scenario starts on a live run.
+
+    `[M] 2026-09-15` a 12-scenario live `baseline` on Gemini printed its plan line and then
+    nothing for several minutes: indistinguishable from a hang to someone watching it, and in
+    CI a silent step. The offline `fake` provider finishes instantly, so it stays quiet.
+    """
+    if provider == "fake":
+        return
+    console.print(f"[dim]  {done}/{total} {_rich_escape(scenario_id)}[/]")
+
+
 def _replay_plan(
     count: int,
     src_dir: str,
@@ -190,7 +327,7 @@ def _replay_plan(
     provider: str,
     judge_model: Optional[str],
     sides: int = 1,
-    ref_runs: Optional[int] = None,
+    ref_runs: Optional[int | Sequence[int]] = None,
 ) -> str:
     """Describe the size of the run that is ABOUT to happen, for the pre-spend line.
 
@@ -236,12 +373,46 @@ def _replay_plan(
         return plan  # canned traces, no network, nothing billed
     plan += f", >={replays} paid calls"
     if judge_model:
-        judged = (count * runs if ref_runs is None else ref_runs) + count * runs
+        # `[M] 2026-09-07` ADR-0040 changed the question the semantic channel asks. It used to
+        # be "is this run equivalent to the ONE modal baseline run", so the bound was simply
+        # `reference runs + candidate runs`. It is now "is this run equivalent to ANY baseline
+        # run", so each candidate run can cost up to `b` calls and each baseline run up to
+        # `b - 1` (leave-one-out). Left at the old formula this line UNDER-disclosed a paid
+        # axis by roughly `b`x -- the same ADR-0019 violation as overstating one, pointed the
+        # other way. `up to` is doing real work here: both short-circuits (identical text, and
+        # stopping at the first equivalence) usually bring the true number far below it.
+        # Per scenario: `b` reference runs (what was RECORDED, MP-72) and `runs` candidate
+        # runs. Each reference run is compared against the other b-1; each candidate run
+        # against all b. The two sides are NOT the same size, and using one for both is the
+        # MP-72 defect over again.
+        #
+        # `[M] 2026-09-07 FP review` The depths must be summed PER SCENARIO, never averaged
+        # first. `b*(b-1)` is convex, so Jensen makes an averaged bound an UNDER-statement on
+        # any uneven baseline -- a state `nonuniform_run_counts` exists precisely because the
+        # store supports. Measured on a first draft of this line: `[5,5,20]` disclosed 420
+        # against a true 570 (26% under), `[1,1,30]` disclosed 420 against 1030 (59% under).
+        # The pre-ADR-0040 formula was linear in the total and so was exact for any shape;
+        # losing that would be the ADR-0019 violation this clause exists to avoid.
+        # A SEQUENCE gives the exact bound for any shape, and `check` passes one. An int keeps
+        # the legacy meaning -- the TOTAL, assumed evenly spread -- and is exact only when the
+        # baseline is uniform, which is why the real call site does not use it.
+        if ref_runs is None:
+            depths = [runs] * count
+        elif isinstance(ref_runs, int):
+            depths = [ref_runs // max(count, 1)] * count
+        else:
+            depths = list(ref_runs)
+        judged = sum(b * max(b - 1, 0) + runs * b for b in depths)
         plan += f" + up to {judged} judge calls"
     return plan
 
 
-def _build_judge(provider: str, cfg: ModelpinConfig, to_model: str | None = None):
+def _build_judge(
+    provider: str,
+    cfg: ModelpinConfig,
+    to_model: str | None = None,
+    from_model: str | None = None,
+):
     """Construct + preflight the semantic LLM-judge if configured. Returns None when no
     judge_model is set or the run is offline (fake), so the diff stays purely structural."""
     if not cfg.judge_model or provider == "fake":
@@ -264,22 +435,46 @@ def _build_judge(provider: str, cfg: ModelpinConfig, to_model: str | None = None
     except (ProviderError, ImportError) as exc:
         _fail(f"semantic judge ({cfg.judge_model!r}): {exc}")
     console.print(f"[dim]semantic judge: {cfg.judge_model} on {host}[/]")
-    if cfg.judge_model == to_model:
+    # MP-196. BOTH sides, not just the candidate. `[M] 2026-09-06` this compared against
+    # `to_model` alone, so a judge equal to the BASELINE never triggered it -- and that is
+    # precisely the state `mp init` shipped, since the scaffold wrote `models: [gpt-4o-mini]`
+    # and `judge_model: gpt-4o-mini`. A brand-new user's first `check` therefore had a judge
+    # reading its own output as the reference, silently.
+    #
+    # The baseline side is not the milder case. A judge grading its own output as the
+    # REFERENCE biases toward calling the pair equivalent, which is a false NEGATIVE -- the
+    # failure the semantic channel exists to prevent, in the run where the user trusts it most.
+    if cfg.judge_model in {m for m in (to_model, from_model) if m}:
         # Not an error -- it can be a deliberate, cheap choice -- but a model judging its own
         # output is not an independent reading of it, and the north-star metric is the FP
         # RATE of what we publish. Say so once, at the point of choosing.
+        side = "being checked" if cfg.judge_model == to_model else "it is compared against"
         console.print(
-            "[yellow]note:[/] the judge model is the model being checked, so the semantic "
+            f"[yellow]note:[/] the judge model is the model {side}, so the semantic "
             "channel is not an independent reading. Prefer a different judge model."
         )
     return judge
 
 
 def _load_config_or_fail(config_path: str) -> ModelpinConfig:
+    # A `--config` the user typed that does not exist is a typo, not a fresh repo. `[M]`
+    # first-run audit 2026-09-15: `baseline --config typo-config.yaml` beside a valid
+    # modelpin.yaml loaded the defaults and blamed a `models:` key that was already set.
+    if config_path != DEFAULT_CONFIG_FILE and not Path(config_path).exists():
+        _fail(f"config file not found: {config_path}")
     try:
-        return load_config(config_path)
+        cfg = load_config(config_path)
     except ConfigError as exc:
         _fail(str(exc))
+    if "regression_threshold" in cfg.model_fields_set:
+        # Accepted so existing configs keep loading, but nothing reads it: the decision rule
+        # is fixed (docs/how-it-works.md). Silently accepting a tuning knob that does nothing
+        # is the defect MP-142 removed for assertion fields (first-run review, 2026-09-15).
+        console.print(
+            "[yellow]note:[/] `regression_threshold` in modelpin.yaml has no effect and can be "
+            "removed; the decision rule is fixed (see docs/how-it-works.md)."
+        )
+    return cfg
 
 
 #: How the directory we searched was chosen — quoted back to the user, because
@@ -541,7 +736,15 @@ def _exercised_tools(*sides: Sequence[Trace]) -> bool:
     return any(t.tool_calls for side in sides for t in side)
 
 
-def _publish_report(markdown: str, store_dir: str, from_model: str, to: str) -> list[str]:
+def _publish_report(
+    markdown: str,
+    store_dir: str,
+    from_model: str,
+    to: str,
+    candidate_traces: Optional[Mapping[str, list[Trace]]] = None,
+    results: Sequence[DiffResult] = (),
+    exit_code: Optional[int] = None,
+) -> list[str]:
     """Write `last-report.md` and its durable archive copy; RETURN the notes to print.
 
     MP-160 extracted this because the zero-comparison exit paths did not write one. `[M]`
@@ -560,7 +763,7 @@ def _publish_report(markdown: str, store_dir: str, from_model: str, to: str) -> 
     notes: list[str] = []
     report_path = Path(store_dir) / "last-report.md"
     try:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_store(report_path.parent)
         report_path.write_text(markdown, encoding="utf-8")
         notes.append(
             f"[dim]PR-style Markdown report written to {_rich_escape(str(report_path))}[/]"
@@ -577,6 +780,33 @@ def _publish_report(markdown: str, store_dir: str, from_model: str, to: str) -> 
         notes.append(f"[dim]archived for citation: {_rich_escape(str(archived))}[/]")
     except OSError as exc:
         notes.append(f"[yellow]warning:[/] could not archive the report: {_rich_escape(str(exc))}")
+        return notes
+    if candidate_traces or results:
+        # The machine-readable record of this run, beside its report: every verdict (the
+        # `DiffResult`s) and every candidate run recorded. A verdict line and one example per
+        # side say WHAT changed; the full runs are what a reviewer needs to decide whether it
+        # matters, and scripts need the verdicts without parsing Markdown. Until now both were
+        # discarded when the process exited. Prompts are excluded, as in a baseline
+        # (ADR-0043); the store's .gitignore keeps the file out of commits.
+        record_path = archived.with_suffix(".json")
+        payload = {
+            "modelpin_version": __version__,
+            "from_model": from_model,
+            "to_model": to,
+            "exit_code": exit_code,
+            "results": [r.model_dump(mode="json") for r in results],
+            "candidate_runs": {
+                sid: [t.model_dump(mode="json", exclude={"messages"}) for t in runs]
+                for sid, runs in (candidate_traces or {}).items()
+            },
+        }
+        try:
+            record_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            notes.append(f"[dim]verdicts and candidate runs: {_rich_escape(str(record_path))}[/]")
+        except OSError as exc:
+            notes.append(
+                f"[yellow]warning:[/] could not save the run record: {_rich_escape(str(exc))}"
+            )
     return notes
 
 
@@ -650,6 +880,12 @@ def _channel_census(
         declared_unused_tools=tuple(
             s.id for s in scenarios if s.input.get("tools") and s.id not in tool_active
         ),
+        # MP-194. The mirror: runs that CALLED a tool the scenario never declared. Read only
+        # by the disclosure wording, and only to stop it saying "called no tool" about a
+        # scenario whose traces show a call -- the clearance itself is unchanged.
+        undeclared_tool_calls=tuple(
+            s.id for s in scenarios if not s.input.get("tools") and s.id in tool_active
+        ),
         # MP-141. Read the fields the ENGINE reads, not the presence of an `Assertion`
         # object. `[M]` `diff/__init__.py` consults only `must_contain` / `must_not_contain`
         # (`structural.py::violates_text_assertions`). MP-147 deleted the two fields that
@@ -680,6 +916,49 @@ def _resolve_match_mode(mode: str) -> str:
     return mode
 
 
+def _effective_match(scenario: Scenario, mode: str) -> MatchMode:
+    """The match mode this ONE scenario is diffed under (MP-227).
+
+    A scenario that declares nothing gets the run's global `--match`, which is how every
+    scenario written before MP-227 behaves. A scenario that declares `match` overrides it,
+    because the relation is a property of the scenario's own prompt: `[M]` a prompt that says
+    of a tool *"use it when it would be useful"* is stating a SUBSET relation, and under
+    `strict` the model exercising that discretion publishes `regression` @ 0.952 and a red
+    build on a same-model null (MP-220). `[M]` The inverse global fix does not work -- making
+    `subset` the default exposes only 3 of the 10 detection rows -- so the declaration has to
+    be per scenario.
+
+    The scenario's value is already one of `VALID_MATCH_MODES`: `Scenario.match` is typed
+    `Literal`, so an unknown mode is refused by `load_scenarios` with the offending file named,
+    before anything is replayed or spent.
+    """
+    # `mode` reaches here only through `_resolve_match_mode`, which `_fail`s on anything
+    # outside `VALID_MATCH_MODES`, and `scenario.match` is typed `Literal` -- so the cast
+    # narrows what is already true and cannot mask a bad value.
+    return cast(MatchMode, scenario.match or mode)
+
+
+def _match_override_note(scenarios: list[Scenario], mode: str) -> str:
+    """A one-line disclosure of every scenario that is NOT being diffed under `--match`.
+
+    Printed beside the run header rather than left implicit. `[M]` The header line already
+    prints `match=<mode>`, and with per-scenario overrides live that line alone would be a
+    false statement about part of the run -- the same class of defect as a published verdict
+    that does not say what produced it. Empty string when nothing overrides, so the ordinary
+    run gains no noise.
+    """
+    overrides = sorted(
+        {s.match for s in scenarios if s.match is not None and s.match != mode}  # type: ignore[misc]
+    )
+    if not overrides:
+        return ""
+    per_mode = [
+        f"{m}: {', '.join(sorted(s.id for s in scenarios if _effective_match(s, mode) == m))}"
+        for m in overrides
+    ]
+    return "scenario `match` overrides -- " + "; ".join(per_mode)
+
+
 @app.command()
 def version() -> None:
     """Print the Modelpin version."""
@@ -687,23 +966,82 @@ def version() -> None:
 
 
 @app.command()
-def scan(path: str = typer.Argument(".", help="Repo root to scan.")) -> None:
+def scan(path: str = typer.Argument(".", help="Repo root, or a single file, to scan.")) -> None:
     """Detect which AI models this repo depends on, and where."""
-    hits = scan_repo(path)
+    skipped: list[str] = []
+    scanned: list[str] = []
+    try:
+        hits = scan_repo(path, skipped=skipped, scanned=scanned)
+    except FileNotFoundError:
+        # `[M] 2026-09-15` A missing path walked nothing and printed "No model identifiers
+        # found.", exit 0 -- a typo read exactly like a clean repo.
+        _fail(f"path not found: {path}")
+    except ScanRefusedError as exc:
+        _fail(str(exc))
     if not hits:
-        console.print("No model identifiers found.")
+        # Say how much was read, so "found nothing" cannot be mistaken for "read nothing".
+        n = len(scanned)
+        console.print(f"No model identifiers found in {n} file{'' if n == 1 else 's'} scanned.")
+        if not n:
+            exts = " ".join(sorted(DEFAULT_EXTS | ENV_TEMPLATE_NAMES))
+            console.print(f"[dim]scan reads these file types: {exts}[/]")
+        _print_scan_skips(skipped)
         return
-    table = Table("model", "file", "line", title="Models this repo depends on", box=ASCII_BOX)
-    for h in sorted(hits, key=lambda x: (x["model"], x["file"], x["line"])):
-        # `Text(...)`, not raw strings: a rich Table parses cell content as MARKUP, and these
-        # cells are paths discovered in someone else's repo. `[M] 2026-09-02` a folder named
-        # `src [experimental]` rendered as `src ` -- `scan` reporting a file path that does
-        # not exist, on one of the first commands a stranger runs. A Next.js repo, whose
-        # route folders are literally `[slug]`, would have every such row corrupted.
-        # `Text` is used rather than `_rich_escape` because it cannot be re-parsed downstream.
-        table.add_row(Text(h["model"]), Text(h["file"]), Text(str(h["line"])))
-    console.print(table)
-    console.print(f"[dim]{len({h['model'] for h in hits})} distinct model(s).[/]")
+
+    # `[M] 2026-09-09` MP-236. The detector labels every hit `code` (a wired-up call or an
+    # active config value) or `comment` (a code comment, or documentation prose). Pooling the
+    # two was the audit's finding: the headline count is the first number a stranger reads and
+    # it must mean models this repo CALLS. A mention is still worth showing -- `# TODO:
+    # evaluate gpt-5.5` is a real intention, and hiding it would be the blind half of the same
+    # defect -- so it is listed and counted separately rather than deleted or merged.
+    called = [h for h in hits if h.get("context", "code") == "code"]
+    mentioned = [h for h in hits if h.get("context", "code") != "code"]
+
+    def _rows(rows: list[dict], title: str) -> Table:
+        table = Table("model", "file", "line", title=title, box=ASCII_BOX)
+        for h in sorted(rows, key=lambda x: (x["model"], x["file"], x["line"])):
+            # `Text(...)`, not raw strings: a rich Table parses cell content as MARKUP, and
+            # these cells are paths discovered in someone else's repo. `[M] 2026-09-02` a
+            # folder named `src [experimental]` rendered as `src ` -- `scan` reporting a file
+            # path that does not exist, on one of the first commands a stranger runs. A
+            # Next.js repo, whose route folders are literally `[slug]`, would have every such
+            # row corrupted. `Text` is used rather than `_rich_escape` because it cannot be
+            # re-parsed downstream.
+            table.add_row(Text(h["model"]), Text(h["file"]), Text(str(h["line"])))
+        return table
+
+    if called:
+        console.print(_rows(called, "Models this repo depends on"))
+        console.print(f"[dim]{len({h['model'] for h in called})} distinct model(s) called.[/]")
+    else:
+        console.print("No model identifiers found in code or configuration.")
+
+    if mentioned:
+        only = {h["model"] for h in mentioned} - {h["model"] for h in called}
+        console.print(_rows(mentioned, "Also mentioned (comments and docs -- not counted above)"))
+        console.print(
+            f"[dim]{len(only)} of these appear only in prose. A mention is not a dependency; "
+            "read them before treating any as one.[/]"
+        )
+    _print_scan_skips(skipped)
+
+
+def _print_scan_skips(skipped: list[str]) -> None:
+    """Say which files `scan` did NOT read, and why.
+
+    MP-242. A file over ``MAX_SCAN_BYTES`` is skipped rather than read, and that must be
+    visible: a scan that quietly looked past a file would be claiming coverage it did not
+    have -- and "No model identifiers found" is exactly the moment a skipped file matters.
+    """
+    if not skipped:
+        return
+    mb = MAX_SCAN_BYTES // (1024 * 1024)
+    shown = ", ".join(_rich_escape(p) for p in skipped[:5])
+    rest = f", and {len(skipped) - 5} more" if len(skipped) > 5 else ""
+    console.print(
+        f"[yellow]note:[/] {len(skipped)} file(s) over {mb} MB were not scanned: "
+        f"{shown}{rest}. A model id inside them would not be listed above."
+    )
 
 
 @app.command()
@@ -715,9 +1053,28 @@ def init(
         help="Write a runnable offline demo instead of scaffolding this repo "
         "(no API key, no cost).",
     ),
+    agent_example: bool = typer.Option(
+        False,
+        "--agent-example",
+        help="Also scaffold a runnable `kind: agent` scenario with input.tools and "
+        "tool_results, showing the tool-call trajectory diff. Costs more to replay.",
+    ),
 ) -> None:
     """Create modelpin.yaml + scenarios/ in the current repo (never overwrites)."""
     root = Path(directory)
+
+    if demo and agent_example:
+        # Refused rather than silently ignored. `--demo` returns before the scaffold path
+        # ever runs, so honouring only one of two flags the user typed is the MP-198 shape:
+        # input stated, discarded without a word, run continues. The two ARE different
+        # things -- the demo is a fake-provider sandbox that costs nothing, this is a
+        # scenario replayed on the user's own key -- so say which one to run.
+        _fail(
+            "--demo and --agent-example scaffold different things and cannot be combined. "
+            "`--demo` writes a self-contained offline sandbox (fake provider, no key, no "
+            "cost); `--agent-example` adds a real agent scenario to THIS repo's scenarios/, "
+            "which `modelpin baseline` replays on your own key. Run whichever you want."
+        )
 
     if demo:
         written = write_demo(root)
@@ -757,8 +1114,17 @@ def init(
     scenarios_dir = root / sub
 
     created: list[str] = []
+    setup = None
     if not cfg_path.exists():
-        cfg_path.write_text(_SAMPLE_CONFIG, encoding="utf-8")
+        # Zero-config: read the model this repo already calls, and which provider credentials
+        # are set, so the first `modelpin baseline` runs instead of asking for a key the user
+        # does not have. A scan failure must never cost the scaffold.
+        try:
+            hits = scan_repo(root)
+        except Exception:  # noqa: BLE001 - best effort; the defaults still load
+            hits = []
+        setup = infer_setup(hits)
+        cfg_path.write_text(render_config(setup), encoding="utf-8")
         created.append(str(cfg_path))
     scenarios_dir.mkdir(parents=True, exist_ok=True)
     # Reserved-aware, and it must stay that way: `_dir_state()` reports a dir holding
@@ -767,13 +1133,67 @@ def init(
     # defect class MP-01 was about, reintroduced one function away.
     existing = [f for f in scenarios_dir.glob("*.json") if f.name not in _RESERVED_IN_DIR]
     if not existing:
-        (scenarios_dir / "greeting.json").write_text(_SAMPLE_SCENARIO, encoding="utf-8")
-        created.append(str(scenarios_dir / "greeting.json"))
+        (scenarios_dir / _SAMPLE_SCENARIO_FILENAME).write_text(_SAMPLE_SCENARIO, encoding="utf-8")
+        created.append(str(scenarios_dir / _SAMPLE_SCENARIO_FILENAME))
+    # Additive, and deliberately NOT gated on `existing`: a user who initialised a week ago
+    # and now wants to see the tool-trajectory feature is the main person who asks for this,
+    # and gating it would hand them the "Already initialised" line and nothing else -- the
+    # no-exit loop MP-01 and the reserved-file glob above were both about.
+    agent_written = write_agent_starter(scenarios_dir) if agent_example else []
+    created.extend(str(p) for p in agent_written)
+
+    # The provider whose SDK the next command will need -- from the config `init` just wrote,
+    # or from the one it adopted. `[M] 2026-09-16` claims audit: gating this on `setup` alone
+    # meant only the very FIRST `init` in a repo could warn, and the user who hits the missing
+    # SDK is usually the one cloning a repo that already HAS a modelpin.yaml onto a machine
+    # that does not have the SDK -- exactly the branch that stayed silent.
+    warn_provider: Optional[str] = setup.provider if setup is not None else None
+    if warn_provider is None and cfg_path.exists():
+        try:
+            configured = load_config(cfg_path).providers
+            warn_provider = configured[0] if configured else None
+        except ConfigError:
+            warn_provider = None  # already reported above; never let advice break `init`
+    sdk_missing = warn_provider is not None and not sdk_installed(warn_provider)
+
     if created:
         console.print("[green]Scaffolded:[/]")
         for c in created:
             console.print(f"  - {_rich_escape(str(c))}")
-        console.print("\nNext: add scenarios, then run [bold]modelpin baseline[/].")
+        if setup is not None:
+            console.print(
+                f"\nConfigured [bold]{_rich_escape(setup.model)}[/] on "
+                f"[bold]{setup.provider}[/] ({_rich_escape(setup.model_source)}), judged by "
+                f"[bold]{_rich_escape(setup.judge_model)}[/]. Edit modelpin.yaml if that is wrong."
+            )
+        steps = [
+            "Put a few real cases from your app in scenarios/ "
+            "(copy the starter file; one JSON file per case)."
+        ]
+        # Two separate ways the next command can fail before it spends anything, and the SDK
+        # one comes first: a key is no use without the library that sends it. `[M]`
+        # `pip install modelpin` + `modelpin init` used to promise "credentials are already
+        # set" and then die on `baseline` with "The Google GenAI SDK is not installed" -- a
+        # wall on the very step `init` had just recommended. Not gated on `setup`: a repo
+        # whose config already existed still needs the warning before `baseline`.
+        if sdk_missing:
+            steps.append(
+                f'[bold]pip install "modelpin\\[providers]"[/]  # the {warn_provider} SDK '
+                "is not installed yet, so the next step cannot run"
+            )
+        if setup is not None:
+            steps.append(
+                f"Credentials for {setup.provider} are already set in your environment."
+                if has_credentials(setup.provider, os.environ)
+                else f"Set {CREDENTIAL_HINT[setup.provider]} in your environment."
+            )
+        steps.append(
+            "[bold]modelpin baseline[/]            # record how your current model behaves"
+        )
+        steps.append("[bold]modelpin check --to <model>[/]  # replay on a candidate and compare")
+        console.print("\nNext:")
+        for number, step in enumerate(steps, start=1):
+            console.print(f"  {number}. {step}")
         console.print(
             "[dim]No API key yet? Run `modelpin init --demo` for a free offline walkthrough.[/]"
         )
@@ -781,8 +1201,9 @@ def init(
         # MP-32: this branch means `init` ADOPTED a config it did not write. Reporting a bare
         # "already initialised" let a cloned repo's config hand the user a scenario set they
         # had never seen, which `baseline` then replayed on their key. Name what was adopted.
-        # `existing` is not stale here: this branch means nothing was created, so no
-        # greeting.json was written after the glob.
+        # `existing` is not stale here: this branch means nothing was created, so neither
+        # greeting.json nor the agent starter was written after the glob -- both append to
+        # `created`, so writing either takes the branch above instead.
         # `sub` is the config's own `scenarios_dir:` value and `cfg_path` derives from the
         # directory argument -- both user-authored text on the line that exists to tell a user
         # WHAT they just adopted (MP-32). Corrupting it defeats the disclosure.
@@ -792,6 +1213,113 @@ def init(
             f"[dim]{len(existing)} scenario(s) in {_sub}/ - `modelpin baseline` replays "
             f"all of them on your own key. Not yours? Check {_rich_escape(str(cfg_path))}.[/]"
         )
+        # This branch names `modelpin baseline` too, so it owes the same warning. It is also
+        # the likelier one to need it: adopting someone else's checked-in modelpin.yaml is
+        # how a person ends up configured for a provider whose SDK they never installed.
+        if sdk_missing:
+            console.print(
+                # `\\[` or rich eats `[providers]` as a markup tag and prints
+                # `pip install "modelpin"` -- an install line that silently drops the extra.
+                f"[yellow]note:[/] the {warn_provider} SDK is not installed, so "
+                "`modelpin baseline` cannot run. Install it with: pip install "
+                '"modelpin\\[providers]"'
+            )
+
+    # Printed on BOTH branches, because both are dead ends for the tool-trajectory feature
+    # otherwise. `[M] 2026-09-09` first-run audit: the only worked agent examples the README
+    # cites live in `examples/suite/`, which ADR-0011 keeps out of the wheel -- so this line
+    # is what stops "go and read GitHub" being the answer to "how do I diff a tool call".
+    if not agent_example:
+        console.print(
+            "[dim]Want to see the tool-call trajectory diff? "
+            "`modelpin init --agent-example` writes a runnable `kind: agent` scenario "
+            "with tools and canned results, annotated.[/]"
+        )
+    elif agent_written:
+        console.print(
+            f"\n[bold]{_rich_escape(AGENT_STARTER_FILENAME)}[/] is a `kind: agent` scenario: "
+            f"one replay drives up to {MAX_TOOL_TURNS} model calls as the tool loop turns, "
+            f"where a `single` scenario costs one. It is a fictional refunds desk - read it, "
+            f"then replace it with your own tools or delete it."
+        )
+    else:
+        console.print(
+            f"[dim]{_rich_escape(AGENT_STARTER_FILENAME)} already exists; left untouched.[/]"
+        )
+
+
+@app.command()
+def draft(
+    source: str = typer.Argument(..., help="ONE source file of your app that builds its prompts."),
+    count: int = typer.Option(3, "--count", help="How many draft scenarios to write."),
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Model that writes the drafts (default: models[0] in config)."
+    ),
+    provider: Optional[str] = typer.Option(None, "--provider", help=provider_help(False)),
+    config_path: str = typer.Option("modelpin.yaml", "--config"),
+    scenarios_dir: Optional[str] = typer.Option(None, "--scenarios-dir"),
+) -> None:
+    """Draft scenarios from one file of your app, for you to review (one model call).
+
+    Drafts go to scenarios/.drafts/, which baseline and check ignore. The system prompt and
+    tools are kept only if they appear in the file; user messages are invented and marked so.
+    """
+    from modelpin.scenarios.draft import DRAFTS_DIRNAME, draft_scenarios
+
+    path = Path(source)
+    if not path.is_file():
+        _fail(f"file not found: {source}")
+    if count < 1:
+        _fail("--count must be at least 1.")
+    cfg = _load_config_or_fail(config_path)
+    model_id = model or (cfg.models[0] if cfg.models else None)
+    if not model_id:
+        _fail("no model to draft with. Pass --model or run `modelpin init` first.")
+    prov = _resolve_provider(provider, cfg)
+    if prov == "fake":
+        _fail("`draft` needs a live model; the offline `fake` provider cannot write scenarios.")
+    adapter = _adapter(prov, None)
+    target = Path(scenarios_dir or cfg.scenarios_dir)
+    size = path.stat().st_size
+    console.print(
+        f"[dim]sending {_rich_escape(str(path))} ({size:,} bytes) to "
+        f"{_rich_escape(model_id)} on {prov} -> 1 paid call. Key-shaped strings are redacted "
+        "first.[/]"
+    )
+    _preflight_or_fail(adapter, prov)
+    try:
+        result = draft_scenarios(path, target, adapter, model_id, count=count)
+    except (ProviderError, ValueError) as exc:
+        _fail(str(exc))
+    except NotImplementedError:
+        _fail(_unimplemented_msg(prov))
+    if result.redacted_secrets:
+        console.print(
+            "[yellow]note:[/] the file contained key-shaped strings; they were replaced with "
+            "[redacted] before sending. Rotate any real credential kept in source code."
+        )
+    if result.dropped_system_prompt:
+        console.print(
+            "[yellow]note:[/] the model's system prompt did not appear in the file word for "
+            "word, so it was left out. Paste your real system prompt into each draft."
+        )
+    if result.dropped_tools:
+        console.print(
+            f"[yellow]note:[/] tools not found in the file were left out: "
+            f"{_rich_escape(', '.join(result.dropped_tools))}."
+        )
+    if not result.written:
+        _fail("the model returned no usable scenarios. Nothing was written; try again.")
+    console.print(f"[green]Drafted {len(result.written)} scenario(s)[/] (not used yet):")
+    for p in result.written:
+        console.print(f"  - {_rich_escape(str(p))}")
+    console.print(
+        f"\nReview each one: replace the invented user message with a real request, check "
+        f"any `tool_results` against what your tools really return, add the `assertions` "
+        f"you expect, then move it from "
+        f"{_rich_escape(str(target / DRAFTS_DIRNAME))} into {_rich_escape(str(target))}. "
+        "Only then does `modelpin baseline` use it."
+    )
 
 
 @app.command()
@@ -823,16 +1351,100 @@ def baseline(
     prov = _resolve_provider(provider, cfg)
     adapter = _adapter(prov, fixtures)
     plan = _replay_plan(len(scenarios), src_dir, n, prov, judge_model=None)
-    console.print(f"[dim]provider={prov} model={from_model} runs={n} | {plan}[/]")
+    console.print(f"[dim]provider={prov} model={_rich_escape(from_model)} runs={n} | {plan}[/]")
     _preflight_or_fail(adapter, prov)
-    traces = _guard_replay(
-        prov, lambda: {s.id: replay(s, from_model, adapter, runs=n) for s in scenarios}
-    )
-    path = save_baseline(traces, from_model, store_dir)
+
+    failed: list[tuple[str, str]] = []
+
+    def _record_all() -> dict[str, list[Trace]]:
+        recorded: dict[str, list[Trace]] = {}
+        for i, s in enumerate(scenarios, start=1):
+            _progress(i, len(scenarios), s.id, prov)
+            try:
+                recorded[s.id] = replay(s, from_model, adapter, runs=n)
+            except ProviderError as exc:
+                # One scenario the provider rejects must not throw away every other paid
+                # recording -- the same rule `check` follows (MP-148). `[M] 2026-09-15` a
+                # Gemini safety block on one of 8 scenarios exited 4 and saved nothing.
+                console.print(
+                    f"[yellow]note:[/] scenario {_rich_escape(repr(s.id))} could not be "
+                    f"recorded: {_rich_escape(str(exc))}"
+                )
+                failed.append((s.id, str(exc)))
+        return recorded
+
+    traces = _guard_replay(prov, _record_all)
+    if not traces:
+        # Nothing recorded at all: almost always one cause for every scenario (a model id that
+        # does not exist, a rejected key), so it is the setup failure it looks like.
+        _fail(
+            f"no scenario could be recorded. First error: {failed[0][1]}"
+            if failed
+            else "no scenario could be recorded."
+        )
+    # MP-197. A store that cannot be written is a setup failure, not a traceback. `_fail`
+    # gives it the friendly message and EXIT_SETUP_FAILED (ADR-0035), which is right: nothing
+    # was measured, so nothing is claimed.
+    try:
+        # MP-05: record WHICH scenario definition produced each set of traces, so a later
+        # `check` can tell whether this baseline describes the scenario it is about to be
+        # compared against. Without it the store answers by id alone and cannot.
+        path = save_baseline(
+            traces,
+            from_model,
+            store_dir,
+            fingerprints={s.id: scenario_fingerprint(s) for s in scenarios},
+        )
+    except BaselineError as exc:
+        _fail(str(exc))
     console.print(
-        f"[green]Baseline recorded[/] for [bold]{from_model}[/]: "
-        f"{len(scenarios)} scenario(s) x{n} runs -> {path}"
+        f"[green]Baseline recorded[/] for [bold]{_rich_escape(from_model)}[/]: "
+        f"{len(traces)} scenario(s) x{n} runs -> {path}"
     )
+    if failed:
+        console.print(
+            f"[yellow]warning:[/] {len(failed)} scenario(s) were NOT recorded and have no "
+            f"baseline: {_rich_escape(', '.join(sid for sid, _ in failed))}. `modelpin check` "
+            "will skip them until a `modelpin baseline` records them."
+        )
+
+    # MP-189. Recording used to be unconditionally green, which made two failure modes silent.
+    # `[M] 2026-09-06` A side whose every run is degenerate exits 0 here, and the later `check`
+    # tells the user to "re-record with `modelpin baseline`" -- which succeeds again under the
+    # same conditions, forever. Naming it at RECORDING time is the only place the loop breaks.
+    degenerate = degenerate_scenarios(traces)
+    if degenerate:
+        named = ", ".join(f"{sid} ({n_runs} run(s))" for sid, n_runs in sorted(degenerate.items()))
+        console.print(
+            f"[yellow]warning:[/] every recorded run is empty for: {named}. "
+            "Nothing was captured for those scenarios -- no tool call, no refusal, no text -- "
+            "so `modelpin check` cannot compare them and will say so. Re-running `modelpin "
+            "baseline` will NOT fix this on its own: check the provider, the model id and the "
+            "scenario's own messages first, because the same conditions produce the same result."
+        )
+
+    # `[M] 2026-09-06` A key-shaped token in a prompt or a model output is persisted verbatim.
+    # `.gitignore` deliberately un-ignores `baseline-*.json` and `actions/README.md` tells the
+    # user to `git add` it, so the default path publishes it. We report and never rewrite:
+    # silently editing recorded evidence would make the artifact disagree with its own run.
+    leaky = secret_bearing_scenarios(traces)
+    if leaky:
+        named = ", ".join(f"{sid} ({n_hits} trace(s))" for sid, n_hits in sorted(leaky.items()))
+        console.print(
+            f"[yellow]warning:[/] a key-shaped token appears in the recorded traces for: {named}. "
+            # MP-240: the baseline no longer stores prompts, so a key found in one lives in the
+            # user's scenario file -- which they commit too. Name both places, and say
+            # precisely what the baseline does still hold, since that is the file we told
+            # them to publish.
+            f"If it is in a prompt, it is in your scenario file; {path} keeps the model's "
+            "output and tool-call arguments verbatim and is NOT git-ignored by default. "
+            "Review both before committing, and rotate the credential if it is real."
+        )
+
+    if failed:
+        # Exit 3, not 0: the store is usable but incomplete, and a CI step recording baselines
+        # must not read a partial recording as a clean one.
+        raise typer.Exit(code=EXIT_UNMEASURED)
 
 
 @app.command()
@@ -845,11 +1457,20 @@ def check(
     ),
     runs: Optional[int] = typer.Option(None, "--runs", help="Replays per scenario."),
     mode: str = typer.Option(
-        "strict", "--match", help="Tool-call match mode: strict|unordered|subset|superset."
+        "strict",
+        "--match",
+        help="Tool-call match mode: strict|unordered|subset|superset. A scenario file's "
+        'own "match" key overrides this for that scenario.',
     ),
     config_path: str = typer.Option("modelpin.yaml", "--config"),
     scenarios_dir: Optional[str] = typer.Option(None, "--scenarios-dir"),
     store_dir: str = typer.Option(STORE_DIRNAME, "--store-dir"),
+    confirm: bool = typer.Option(
+        True,
+        "--confirm/--no-confirm",
+        help="Before a regression can fail the build, replay the candidate again for that "
+        "scenario and require the regression to reproduce (default: on).",
+    ),
 ) -> None:
     """Replay scenarios on a new model and report behavioral regressions.
 
@@ -857,12 +1478,24 @@ def check(
     3 = the run could not answer -- a scenario that WAS compared could not be measured, OR
     the provider rejected a scenario, OR nothing could be compared at all (no usable
     baseline; every scenario skipped or rejected). 3 is deliberately not 1: "we could not
-    tell" is a different claim from "it broke". A configuration error is neither: no
-    scenarios found exits 1, and a bad flag exits 2, which is Click's usage code.
+    tell" is a different claim from "it broke". 4 = Modelpin never produced a verdict at all:
+    a missing key, an unusable flag, an unreadable config, no scenarios. 2 is Click's own
+    usage code and we do not emit it.
 
-    A scenario with no recorded baseline is the deliberate exception: it is named in the
+    `[M] 2026-09-06` The previous two sentences here read *"A configuration error is neither:
+    no scenarios found exits 1, and a bad flag exits 2, which is Click's usage code."* **Both
+    halves were false.** `_fail` exited 1 across all 28 of its call sites, so a missing
+    `OPENAI_API_KEY` and `--match nonsense` both returned the CI-gate code -- which
+    `action.yml` publishes as "Modelpin detected a behavioral regression". ADR-0035 gives
+    setup failure its own code so that this docstring can be true.
+
+    A scenario that cannot be compared is the deliberate exception: it is named in the
     report, on the console and in the archive, and it removes the affirmative clearance, but
-    it does not by itself fail the build. `[M]` Precisely: it does not change the exit code,
+    it does not by itself fail the build. Three conditions reach it -- no baseline was
+    recorded; the scenario was EDITED since its baseline was (comparing it would measure the
+    edit, not the model); or the baseline records no scenario fingerprint, so nothing can
+    confirm it describes this scenario. The last is what every store written before
+    fingerprints looks like: re-run `modelpin baseline` once. See ADR-0033 and ADR-0039. `[M]` Precisely: it does not change the exit code,
     so a run keeps whatever its COMPARED scenarios earned -- 0 if they were clean, 1 if one
     of them regressed. Only when NOTHING is left to compare does the run abstain with 3.
     Reasoning, options and revisit trigger: ADR-0033.
@@ -917,6 +1550,7 @@ def check(
     # right not to fail over a file it can use, and the user can act on this before spending.
     # Printed BEFORE the pre-spend disclosure below, which prices the whole run off
     # `min(baseline_sizes)` and so describes the weakest scenario, not every one.
+    _recorded_fp = load_baseline_fingerprints(from_model, store_dir)
     uneven = nonuniform_run_counts(base, [s.id for s in scenarios])
     if uneven:
         # `escape`, not raw: `[M]` a first-run review crashed `mp check` with an unhandled
@@ -925,7 +1559,7 @@ def check(
         # every console string through this path; `report/render_cli` already escapes them.
         detail = ", ".join(f"{_rich_escape(sid)}={k}" for sid, k in sorted(uneven.items()))
         console.print(
-            f"[yellow]warning:[/] the baseline for '{from_model}' holds different numbers of "
+            f"[yellow]warning:[/] the baseline for '{_rich_escape(from_model)}' holds different numbers of "
             f"recorded runs per scenario ({detail}), so statistical power differs between "
             f"them and some may be unable to report a regression at all. Re-record with "
             f"`modelpin baseline --runs {RECOMMENDED_RUNS}` for uniform coverage."
@@ -939,13 +1573,37 @@ def check(
     # bounds this run's replays, not a past run's recording. Counting the traces on disk
     # rather than assuming `n` of them is what keeps `up to N judge calls` a bound when a
     # 20-run baseline is checked at `--runs 5`. MP-72.
-    ref_runs = sum(len(t) for t in (base.get(s.id) or [] for s in scenarios))
+    # `[M] 2026-09-07 FP review` PER SCENARIO, not summed: under ADR-0040 the judge bound is
+    # convex in a scenario's recorded depth, so collapsing the depths to a total and spreading
+    # them evenly UNDER-states an uneven baseline by up to 59%. The list is available here; the
+    # sum was throwing away exactly the information the bound needs.
+    ref_runs = [len(base.get(s.id) or []) for s in scenarios if base.get(s.id)]
     plan = _replay_plan(billable, src_dir, n, prov, cfg.judge_model, ref_runs=ref_runs)
     console.print(
-        f"[dim]provider={prov} from={from_model} to={to} runs={n} match={mode} | {plan}[/]"
+        f"[dim]provider={prov} from={_rich_escape(from_model)} to={_rich_escape(to)} runs={n} match={mode} | {plan}[/]"
     )
+    # MP-227. The line above says `match=<mode>`; with per-scenario overrides live that
+    # is only true of the scenarios that declare nothing, so name the rest before the
+    # run rather than leaving the header quietly wrong about part of it.
+    if _note := _match_override_note(scenarios, mode):
+        console.print(f"[dim]{_rich_escape(_note)}[/]")
+    if confirm and prov != "fake":
+        # ADR-0019: the confirmation is a paid axis, so its size is disclosed before spending.
+        # Per flagged scenario the fresh sample is `n` replays, and re-diffing it can ask the
+        # judge up to `b(b-1)` baseline leave-one-out questions plus `n*b` candidate ones.
+        _deepest = max(ref_runs, default=n)
+        _judge_extra = (
+            f", up to {_deepest * max(_deepest - 1, 0) + n * _deepest} judge calls"
+            if cfg.judge_model
+            else ""
+        )
+        console.print(
+            f"[dim]a scenario flagged as a regression is replayed again before it can fail "
+            f"the build: +{n} replays{_judge_extra} per flagged scenario (--no-confirm to "
+            "skip)[/]"
+        )
     _preflight_or_fail(adapter, prov)
-    judge = _build_judge(prov, cfg, to_model=to)
+    judge = _build_judge(prov, cfg, to_model=to, from_model=from_model)
 
     results = []
     skipped: list[str] = []
@@ -954,13 +1612,46 @@ def check(
     #: a loop local and `DiffResult` carries no traces, so a census computed after the loop
     #: has nothing left to read and used to fall back on the declaration.
     tool_active: set[str] = set()
+    #: One baseline and one candidate run per flagged scenario, shown beside its verdict.
+    examples: dict[str, tuple[Example, Example]] = {}
+    #: Every candidate run recorded, per compared scenario, archived beside the report.
+    candidate_runs: dict[str, list[Trace]] = {}
     #: (scenario_id, provider message) for scenarios the provider REFUSED outright. A
     #: different condition from `skipped` (no baseline recorded) and from an
     #: `insufficient_evidence` verdict (replayed, but nothing usable came back).
     rejected: list[tuple[str, str]] = []
 
+    # MP-05 / ADR-0039. Which scenario DEFINITION each baseline entry was recorded against.
+    # A scenario absent from this map has no recorded provenance (a baseline written before
+    # the fingerprint shipped); that is unverifiable, not stale, and is left alone.
+    _stale = stale_scenarios(((s.id, scenario_fingerprint(s)) for s in scenarios), _recorded_fp)
+    _stale_ids = {sid for sid, _, _ in _stale}
+    #: Baselined scenarios whose store records no fingerprint at all — written before MP-05,
+    #: or shipped inside a clone. These are not KNOWN to be wrong; they are unverifiable, and
+    #: they are refused for the same reason a mismatch is. `[M]` This is the exact path MP-69
+    #: measured: a fresh clone's tracked baseline plus a user's own `scenarios/refund_request
+    #: .json` — two scenarios sharing nothing but a filename — produced `REGRESSION ...
+    #: confidence 0.99`, exit 1, the code the GitHub Action fails a PR on. "If Modelpin says
+    #: it broke, it broke" cannot survive a pairing nothing can vouch for, so an unprovable
+    #: comparison abstains (ADR-0018) instead of being asserted at confidence 0.99.
+    _unverified = sorted(s.id for s in scenarios if s.id in base and s.id not in _recorded_fp)
+    _unverified_ids = set(_unverified)
+
     def _run_check() -> None:
-        for s in scenarios:
+        for _i, s in enumerate(scenarios, start=1):
+            _progress(_i, len(scenarios), s.id, prov)
+            if s.id in _stale_ids or s.id in _unverified_ids:
+                # The store holds traces recorded against a DIFFERENT definition of this
+                # scenario. Comparing them measures the edit, not the model, and it does so
+                # confidently in whichever direction the edit happened to push: a stale
+                # baseline over a candidate that started refusing prints `OK ... unchanged`
+                # and exit 0, while two scenarios sharing only a filename print `REGRESSION
+                # ... confidence 0.99` and exit 1. Both are the north-star promise inverted,
+                # so this pairing is not made at all: the scenario joins `skipped`, is
+                # disclosed on the console and in the published report, and is replayed by
+                # nothing - which also means the user is not charged for it.
+                skipped.append(s.id)
+                continue
             base_traces = base.get(s.id)
             if not base_traces:
                 skipped.append(s.id)
@@ -987,11 +1678,55 @@ def check(
                 )
                 rejected.append((s.id, str(exc)))
                 continue
+
+            def _diff(candidate: list[Trace], s: Scenario = s, base_traces=base_traces):
+                return diff_scenario(
+                    s.id,
+                    from_model,
+                    to,
+                    base_traces,
+                    candidate,
+                    s,
+                    # MP-227: the scenario's own declaration wins over the global flag.
+                    _effective_match(s, mode),
+                    judge=judge,
+                )
+
+            stage = "the semantic judge failed"
+            try:
+                result = _diff(cand)
+                if confirm and result.verdict == DiffVerdict.regression:
+                    stage = (
+                        "it was flagged as a regression, but re-checking it on fresh "
+                        "candidate runs failed"
+                    )
+
+                    def _replay_more(s: Scenario = s) -> list[Trace]:
+                        return replay(s, to, adapter, runs=n)
+
+                    result, cand = confirm_regression(
+                        result, cand, replay_more=_replay_more, rediff=_diff
+                    )
+            except ProviderError as exc:
+                # The judge spends a provider call too, and so does a confirmation replay.
+                # One that fails after the SDK's own retries must cost this scenario its
+                # verdict, not the whole run: every other scenario's paid replays still stand.
+                # Same disclosure and exit path as a replay the provider rejected (MP-148),
+                # and the stage is named so a flagged first sample is not silently lost.
+                console.print(
+                    f"[yellow]note:[/] scenario {_rich_escape(repr(s.id))} could not be "
+                    f"compared ({stage}): {_rich_escape(str(exc))}"
+                )
+                rejected.append((s.id, f"{stage}: {exc}"))
+                continue
             if _exercised_tools(base_traces, cand):
                 tool_active.add(s.id)
-            results.append(
-                diff_scenario(s.id, from_model, to, base_traces, cand, s, mode, judge=judge)
-            )
+            if result.verdict != DiffVerdict.unchanged:
+                pair = pick_examples(base_traces, cand)
+                if pair:
+                    examples[s.id] = pair
+            candidate_runs[s.id] = cand
+            results.append(result)
 
     # NotImplementedError stays a HARD failure: an unimplemented adapter is a config error
     # that would fail every scenario identically, so swallowing it per scenario would turn a
@@ -1017,32 +1752,66 @@ def check(
         if rejected:
             _why.append(f"the provider rejected {len(rejected)} scenario(s)")
         if skipped:
-            _why.append(f"{len(skipped)} scenario(s) had no recorded baseline")
+            _why.append(f"{len(skipped)} scenario(s) had no usable baseline")
         detail = " and ".join(_why) if _why else "no scenario produced a comparison"
         console.print(f"[yellow]could not measure:[/] nothing was compared -- {detail}.")
-        if skipped:
+        # `[M] 2026-09-07 first-run review` This branch used to print `no baseline: <ids>` for
+        # EVERY skipped id, which is false for the two conditions MP-05 added and is the shape
+        # an upgrading user meets first: their whole store predates the fingerprint, so every
+        # scenario lands here and every one of them is told it has no baseline when it plainly
+        # has one. The carefully worded stale/unverified notes further down sit past this
+        # `raise` and were unreachable exactly when they mattered most. Each cause now names
+        # itself, and only genuinely un-baselined ids get the un-baselined sentence.
+        _no_base = [sid for sid in skipped if sid not in _stale_ids | _unverified_ids]
+        if _no_base:
             console.print(
-                f"[dim]   no baseline: {_rich_escape(', '.join(skipped))}. "
+                f"[dim]   no baseline: {_rich_escape(', '.join(_no_base))}. "
                 f"Record one with `modelpin baseline`.[/]"
             )
+        for _sid, _was, _now in _stale:
+            console.print(
+                f"[dim]   changed since its baseline: {_rich_escape(_sid)} "
+                f"(recorded against {_was}, now {_now}). Comparing it would measure your "
+                f"edit, not the model.[/]"
+            )
+        if _unverified:
+            console.print(
+                f"[dim]   no recorded fingerprint, so nothing can confirm the baseline "
+                f"describes these scenarios: {_rich_escape(', '.join(_unverified))}. A store "
+                f"written before this version, or one that arrived inside a clone, cannot "
+                f"vouch for what it holds.[/]"
+            )
+        if _stale or _unverified:
+            console.print("[dim]   Re-run `modelpin baseline` once to re-record them.[/]")
         # `[M]` This path wrote NO artifact, so the PREVIOUS run's `last-report.md` stayed on
         # disk as the reviewer-facing verdict -- and `action.yml` posts that file whenever it
         # exists, regardless of the exit code. A run that compared nothing has to say so in
         # the artifact, not only on a console nobody reads.
-        _publish_report(
+        #
+        # `[M] 2026-09-07` The notes were DISCARDED here while the sibling branch above prints
+        # them, so the one surface that names MP-05 in this exact situation -- the Markdown
+        # header -- was written and never pointed to.
+        for _note in _publish_report(
             render_pr_comment([], from_model, to, n, prov, (), None, rejected, skipped),
             store_dir,
             from_model,
             to,
-        )
+        ):
+            console.print(_note)
         raise typer.Exit(code=EXIT_UNMEASURED)
 
     # MP-55. Which scenarios were compared at run counts where NO signal could reach ALPHA?
     # Computed per scenario, because a stored baseline can hold a different number of runs
     # than `--runs` gives the candidate (`baseline --runs 5` then `check --runs 2` is 5v2),
     # and the permutation floor depends on BOTH sides.
-    def _blind(sid: str) -> bool:
-        return _cannot_reach_alpha(len(base[sid]), n, mode)
+    def _blind(s: Scenario) -> bool:
+        # MP-227: the EFFECTIVE mode, not the global flag. `_cannot_reach_alpha` branches on
+        # `mode in EQUIVALENCE_MODES` -- the equivalence modes route the tool and argument
+        # signals through the two-sided test, whose floor is higher -- so pricing a
+        # `subset`-declaring scenario under a global `strict` would assert blindness about
+        # signals that can and do fire on it. That is a disclosure describing a run that did
+        # not happen, the exact defect the comment below this one exists to prevent.
+        return _cannot_reach_alpha(len(base[s.id]), n, _effective_match(s, mode))
 
     # The scenarios that actually produced `results` -- a scenario with no stored baseline is
     # skipped above and never diffed. Both disclosures below must be read off THIS set, or
@@ -1053,14 +1822,16 @@ def check(
     # trap with a new cause.
     _rejected_ids = {sid for sid, _ in rejected}
     compared = [s for s in scenarios if base.get(s.id) and s.id not in _rejected_ids]
-    underpowered = [s.id for s in compared if _blind(s.id)]
+    underpowered = [s.id for s in compared if _blind(s)]
 
     # MP-138. `underpowered` above prices RUN COUNT. This prices CHANNEL AVAILABILITY --
     # the other way a run can be structurally unable to fail, and one `_resolve_runs`
     # cannot see because it is not a function of N.
     census = _channel_census(compared, judge, prov, tool_active=tool_active)
 
-    _summary = render_cli(results, from_model, to, n, underpowered, census, rejected, skipped)
+    _summary = render_cli(
+        results, from_model, to, n, underpowered, census, rejected, skipped, examples=examples
+    )
 
     # Decide the CI exit code BEFORE any side effect, so a report-write failure
     # can never silently mask a real regression.
@@ -1075,9 +1846,26 @@ def check(
     # The housekeeping notes are held and printed after the summary, so reading order is
     # unchanged: verdict first, file paths after.
     markdown = render_pr_comment(
-        results, from_model, to, n, prov, underpowered, census, rejected, skipped
+        results,
+        from_model,
+        to,
+        n,
+        prov,
+        underpowered,
+        census,
+        rejected,
+        skipped,
+        # MP-227. `action.yml` posts THIS artifact and never reads the console note above,
+        # so a scenario compared under a looser relation than the run's `--match` has to say
+        # so here or the PR reviewer cannot see it at all. Read off `compared`, so a scenario
+        # that declared a mode but was never diffed does not claim to have been.
+        match_overrides={s.id: s.match for s in compared if s.match and s.match != mode},
+        examples=examples,
     )
-    _publish_notes = _publish_report(markdown, store_dir, from_model, to)
+    _exit_code = 1 if has_regression else EXIT_UNMEASURED if (unmeasured or rejected) else 0
+    _publish_notes = _publish_report(
+        markdown, store_dir, from_model, to, candidate_runs, results, _exit_code
+    )
     console.print(_summary)
     for _note in _publish_notes:
         console.print(_note)
@@ -1095,10 +1883,45 @@ def check(
         # comment sent the next reader hunting a bug that had already been fixed one commit
         # earlier -- which is how this codebase accumulated four comments each claiming the
         # last unescaped site was closed.
-        console.print(
-            f"[yellow]note:[/] {len(skipped)} scenario(s) had no baseline and were skipped: "
-            f"{_rich_escape(', '.join(skipped))}. Re-run `modelpin baseline` to cover them."
-        )
+        _no_baseline = [sid for sid in skipped if sid not in _stale_ids | _unverified_ids]
+        if _unverified:
+            console.print(
+                f"[yellow]note:[/] {len(_unverified)} scenario(s) have a baseline that records "
+                "no scenario fingerprint, so nothing can confirm it was recorded against the "
+                f"scenario of the same name: {_rich_escape(', '.join(_unverified))}. They were "
+                "NOT compared."
+            )
+            console.print(
+                "[dim]   A baseline recorded before this version, or one that arrived inside a "
+                "clone, cannot vouch for what it describes — and an id collision there reports "
+                "a confident regression over two scenarios sharing only a filename. Re-run "
+                "`modelpin baseline` once to record fingerprints.[/]"
+            )
+        if _no_baseline:
+            console.print(
+                f"[yellow]note:[/] {len(_no_baseline)} scenario(s) had no baseline and were "
+                f"skipped: {_rich_escape(', '.join(_no_baseline))}. Re-run `modelpin baseline` "
+                "to cover them."
+            )
+        if _stale:
+            # Louder than the no-baseline note, and worded as a REFUSAL rather than a skip.
+            # `[M]` This is the path that printed `OK 1 scenario(s) unchanged`, exit 0, over a
+            # scenario rewritten from "Say hello." to "Delete the production database and
+            # confirm." — the stale store was the only difference between a green tick and a
+            # confident regression, and nothing said so.
+            console.print(
+                f"[yellow]note:[/] {len(_stale)} scenario(s) CHANGED since the baseline for "
+                f"{_rich_escape(from_model)} was recorded, so the recorded traces describe a "
+                "different scenario and were NOT compared:"
+            )
+            for _sid, _was, _now in _stale:
+                console.print(
+                    f"[dim]   {_rich_escape(_sid)}: recorded against {_was}, now {_now}[/]"
+                )
+            console.print(
+                "[dim]   Comparing them would measure your edit, not the model. Re-run "
+                "`modelpin baseline` to re-record them.[/]"
+            )
 
     if has_regression:
         raise typer.Exit(code=1)  # fail CI on a real regression
@@ -1121,6 +1944,10 @@ def check(
 REPORT_ARCHIVE_DIRNAME = "runs"
 
 
+#: Longest archive path written as-is; a longer one gets a short name (see `_archive_path`).
+_MAX_ARCHIVE_PATH = 240
+
+
 def _archive_path(store: Path, from_model: str, to_model: str, stamp: str | None = None) -> Path:
     """A collision-free, citable path for THIS run's report.
 
@@ -1133,6 +1960,14 @@ def _archive_path(store: Path, from_model: str, to_model: str, stamp: str | None
     directory = store / REPORT_ARCHIVE_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
     stem = f"check-{slug(from_model)}-to-{slug(to_model)}-{stamp}"
+    # Windows refuses a path over 260 characters unless long paths are enabled, and both model
+    # ids go into this name. `[M] 2026-09-15` a project four directories deep in the user's
+    # temp folder, checking `gemini-2.5-flash-lite` against itself, lost its archived report
+    # (`[Errno 2] No such file or directory`) and the run record with it. Over the limit, the
+    # ids are replaced by a short digest; the report itself still names both models.
+    if len(str((directory / f"{stem}-99.json").resolve())) > _MAX_ARCHIVE_PATH:
+        digest = hashlib.sha1(f"{from_model}|{to_model}".encode()).hexdigest()[:8]
+        stem = f"check-{stamp}-{digest}"
     candidate = directory / f"{stem}.md"
     n = 2
     while candidate.exists():
@@ -1170,7 +2005,10 @@ def report(
     ),
     runs: Optional[int] = typer.Option(None, "--runs", help="Replays per scenario per model."),
     mode: str = typer.Option(
-        "strict", "--match", help="Tool-call match mode: strict|unordered|subset|superset."
+        "strict",
+        "--match",
+        help="Tool-call match mode: strict|unordered|subset|superset. A scenario file's "
+        'own "match" key overrides this for that scenario.',
     ),
     suite_dir: str = typer.Option(
         ...,
@@ -1203,14 +2041,23 @@ def report(
     # suite. The JUDGE axis is not -- `check` reads its reference side off disk, so its judge
     # figure tracks the stored baseline's depth (ADR-0026). User's own key (ADR-0008).
     plan = _replay_plan(len(scenarios), suite_dir, n, prov, cfg.judge_model, sides=2)
-    console.print(f"[dim]provider={prov} from={from_} to={to} runs={n} match={mode} | {plan}[/]")
+    console.print(
+        f"[dim]provider={prov} from={_rich_escape(from_)} to={_rich_escape(to)} runs={n} match={mode} | {plan}[/]"
+    )
+    # MP-227. The line above says `match=<mode>`; with per-scenario overrides live that
+    # is only true of the scenarios that declare nothing, so name the rest before the
+    # run rather than leaving the header quietly wrong about part of it.
+    if _note := _match_override_note(scenarios, mode):
+        console.print(f"[dim]{_rich_escape(_note)}[/]")
     _preflight_or_fail(adapter, prov)
-    judge = _build_judge(prov, cfg, to_model=to)
+    judge = _build_judge(prov, cfg, to_model=to, from_model=from_)
 
     results: list[DiffResult] = []
     skipped: list[str] = []
     tool_active: set[str] = set()  # MP-159, as in `check`: read off the traces, not the suite
-    for s in scenarios:
+    report_examples: dict[str, tuple[Example, Example]] = {}
+    for _i, s in enumerate(scenarios, start=1):
+        _progress(_i, len(scenarios), s.id, prov)
         try:
             base_traces = replay(s, from_, adapter, runs=n)
             cand_traces = replay(s, to, adapter, runs=n)
@@ -1232,8 +2079,21 @@ def report(
         if _exercised_tools(base_traces, cand_traces):
             tool_active.add(s.id)
         results.append(
-            diff_scenario(s.id, from_, to, base_traces, cand_traces, s, mode, judge=judge)
+            _report_result := diff_scenario(
+                s.id,
+                from_,
+                to,
+                base_traces,
+                cand_traces,
+                s,
+                # MP-227: the scenario's own declaration wins over the global flag.
+                _effective_match(s, mode),
+                judge=judge,
+            )
         )
+        if _report_result.verdict != DiffVerdict.unchanged:
+            if pair := pick_examples(base_traces, cand_traces):
+                report_examples[s.id] = pair
 
     if not results:
         _fail("no scenarios completed; nothing to report.")
@@ -1248,10 +2108,14 @@ def report(
     # still materialised per scenario: the renderers name the blind ones, and a future
     # per-scenario run count must not need this call site changed to stay honest.
     compared = [s for s in scenarios if s.id not in set(skipped)]
-    underpowered = [s.id for s in compared] if _cannot_reach_alpha(n, n, mode) else []
+    # MP-227 made the "future" in the comment above arrive early, from the MODE axis rather
+    # than the run-count one: `_cannot_reach_alpha` branches on `mode in EQUIVALENCE_MODES`,
+    # so blindness is no longer all-or-nothing once a scenario declares its own `match`. It is
+    # now evaluated per scenario, as the comment promised it would already be.
+    underpowered = [s.id for s in compared if _cannot_reach_alpha(n, n, _effective_match(s, mode))]
     census = _channel_census(compared, judge, prov, tool_active=tool_active)
 
-    console.print(render_cli(results, from_, to, n, underpowered, census))
+    console.print(render_cli(results, from_, to, n, underpowered, census, examples=report_examples))
 
     suite_id, suite_version = read_manifest(suite_dir)
     date_iso = datetime.now(timezone.utc).date().isoformat()
@@ -1271,8 +2135,14 @@ def report(
         reference_model=from_,
         provider=prov,
         runs=n,
-        judge_model=cfg.judge_model if judge is not None else "disabled",
+        # `_build_judge` returns None whenever `judge_model` is unset, so a live judge always
+        # has an id; `or "disabled"` states that instead of asserting it.
+        judge_model=cfg.judge_model or "disabled" if judge is not None else "disabled",
         match_mode=mode,
+        # MP-227. `match_mode` above is the run's GLOBAL flag; these are the scenarios that
+        # did not use it. Read off `compared`, not off every loaded scenario, so the Report
+        # names the overrides that were actually exercised.
+        match_overrides={s.id: s.match for s in compared if s.match and s.match != mode},
         modelpin_version=__version__,
         diff_thresholds={
             "alpha": ALPHA,
@@ -1325,7 +2195,33 @@ def report(
     # NB: report() never exits non-zero on a regression — it publishes findings, not a CI gate.
 
 
+def _use_os_trust_store() -> None:
+    """Verify TLS against the operating system's certificate store on Windows and macOS.
+
+    The provider SDKs verify against `certifi`'s bundled CA list, which knows nothing about a
+    corporate TLS-inspecting proxy's root certificate. `[M]` On such a network every live call
+    fails with `CERTIFICATE_VERIFY_FAILED` although the machine itself trusts the proxy -- a
+    stranger's first `modelpin baseline` dies before it measures anything. `truststore` makes
+    Python ask the OS instead. Verification stays ON; only the source of trusted roots changes.
+
+    Windows and macOS only: their system store is always present and authoritative. A minimal
+    Linux container may have no system CA bundle at all, where `certifi` is the one that works.
+    Opt out with MODELPIN_NO_TRUSTSTORE=1. Absent `truststore`, nothing changes.
+    """
+    if sys.platform not in ("win32", "darwin") or os.environ.get("MODELPIN_NO_TRUSTSTORE"):
+        return
+    try:
+        import truststore
+    except ImportError:
+        return
+    try:
+        truststore.inject_into_ssl()
+    except Exception:  # noqa: BLE001 - never let TLS plumbing stop the CLI from starting
+        return
+
+
 def main() -> None:
+    _use_os_trust_store()
     app()
 
 

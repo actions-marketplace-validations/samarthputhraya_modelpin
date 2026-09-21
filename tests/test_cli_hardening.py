@@ -4,7 +4,7 @@ never raw tracebacks, and never silently produce a misleading result. All offlin
 
 from typer.testing import CliRunner
 
-from modelpin.cli import EXIT_UNMEASURED, app
+from modelpin.cli import EXIT_SETUP_FAILED, EXIT_UNMEASURED, app
 
 runner = CliRunner()
 
@@ -51,7 +51,7 @@ def test_runs_floor_rejects_single_run(tmp_path):
         app,
         ["baseline", "--provider", "fake", "--model", "m", "--scenarios-dir", scen, "--runs", "1"],
     )
-    assert r.exit_code == 1
+    assert r.exit_code == EXIT_SETUP_FAILED
     assert "runs must be >= 2" in r.output
 
 
@@ -71,7 +71,7 @@ def test_unknown_provider_fails_friendly(tmp_path):
             "5",
         ],
     )
-    assert r.exit_code == 1
+    assert r.exit_code == EXIT_SETUP_FAILED
     assert "banana" in r.output.lower()
     # a friendly error line, not a Python traceback
     assert "Traceback" not in r.output
@@ -96,7 +96,7 @@ def test_missing_openai_key_fails_friendly_not_traceback(tmp_path, monkeypatch):
             str(tmp_path / ".modelpin"),
         ],
     )
-    assert r.exit_code == 1
+    assert r.exit_code == EXIT_SETUP_FAILED
     assert "OPENAI_API_KEY is not set" in r.output
     assert "Traceback" not in r.output
     # preflight failed before any baseline file was written
@@ -123,7 +123,7 @@ def test_malformed_config_fails_friendly(tmp_path):
     )
     # Branch-agnostic: the YAML may fail to parse OR be classified non-mapping by a
     # future PyYAML; either way the contract is a friendly error, not a traceback.
-    assert r.exit_code == 1
+    assert r.exit_code == EXIT_SETUP_FAILED
     assert "Traceback" not in r.output
     assert "error:" in r.output
 
@@ -134,7 +134,7 @@ def test_malformed_scenario_fails_friendly(tmp_path):
         app,
         ["baseline", "--provider", "fake", "--model", "m", "--scenarios-dir", scen, "--runs", "5"],
     )
-    assert r.exit_code == 1
+    assert r.exit_code == EXIT_SETUP_FAILED
     assert "broken.json" in "".join(r.output.split())
     assert "Traceback" not in r.output
 
@@ -197,15 +197,21 @@ def test_check_warns_about_skipped_scenarios(tmp_path):
     assert rc.exit_code == 0, rc.output
     # Parse the actual skipped-note line and assert the specific id — so this test
     # genuinely fails if item 13 (skip transparency) ever regresses.
-    note = next(
-        (ln for ln in rc.output.splitlines() if "had no baseline and were skipped" in ln), None
-    )
-    assert note is not None, rc.output
+    # Read from the UNWRAPPED output: rich hard-wraps the console at 80 columns, so an id can
+    # sit on the continuation line of the note that names it. `[M] 2026-09-07` asserting
+    # against a single wrapped line broke when the note's wording grew by four words, which
+    # tests the terminal width rather than skip transparency.
+    flat = " ".join(rc.output.split())
+    marker = "had no baseline and were skipped:"
+    assert marker in flat, rc.output
+    note = flat[flat.index(marker) : flat.index(".", flat.index(marker))]
     assert "greet_bravo" in note
     assert "greet_alpha" not in note
 
 
-def test_init_scaffolds_openai_not_anthropic_stub(tmp_path):
+def test_init_scaffolds_openai_as_the_documented_default(tmp_path):
+    # The scaffold names ONE provider and its key; it must match DEFAULT_PROVIDER rather than
+    # drift to another vendor's account now that more than one adapter runs.
     runner.invoke(app, ["init", str(tmp_path)])
     cfg = (tmp_path / "modelpin.yaml").read_text()
     assert "openai" in cfg
@@ -273,7 +279,7 @@ def test_baseline_fails_when_fixtures_are_omitted_entirely(tmp_path):
          "--scenarios-dir", scen, "--store-dir", str(store), "--runs", "5"],
         # fmt: on
     )
-    assert r.exit_code == 1, r.output
+    assert r.exit_code == EXIT_SETUP_FAILED, r.output
     assert "fixtures" in r.output.lower()
     assert "Traceback" not in r.output
     assert not list(store.glob("baseline-*.json")), "a run that measured nothing was stored"
@@ -295,6 +301,6 @@ def test_report_writes_no_file_when_nothing_could_be_replayed(tmp_path):
          "--suite-dir", scen, "--runs", "5", "--output-dir", str(out)],
         # fmt: on
     )
-    assert r.exit_code == 1, r.output
+    assert r.exit_code == EXIT_SETUP_FAILED, r.output
     assert not list(out.glob("*.md")), "published a Report from a run that measured nothing"
     assert not list(out.glob("*.json"))

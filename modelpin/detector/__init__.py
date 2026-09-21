@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
+import bisect
 import re
 from pathlib import Path
 from typing import Iterable
+
+from modelpin.config import DEFAULT_CONFIG_FILE
+from modelpin.storage import STORE_DIRNAME
 
 #: The o-series numbers that actually exist. `[M] 2026-08-29` the pattern was `o[0-9]`,
 #: which matched **`o2`** at `rich/_emoji_codes.py:3381`, whose content is `"o2": "\U0001f17e"`
@@ -15,23 +19,277 @@ from typing import Iterable
 #: the north-star failure showing up in the first command a stranger runs. Add `5` here when
 #: `o5` ships; `tests/test_detector_patterns.py` documents that this is the one-token edit.
 _O_SERIES_DIGITS = "134"
+# The suffix must be introduced by `-`, so `o3` and `o3-deep-research-2025-06-26` match
+# while `o3XPaKcS` does not: after `o3` comes a word character, so there is no `\b` for
+# the bare alternative and no `-` for the suffixed one. `[M] 2026-08-31` that token is
+# not hypothetical -- it is in this repo, in `.modelpin/drift_cache_drift-suite.json`.
+_O_SERIES = re.compile(rf"\bo[{_O_SERIES_DIGITS}](?:-[\w.\-]*)?\b")
 # Conservative patterns; extend as providers add families.
 MODEL_PATTERNS = [
     re.compile(r"\bgpt-[0-9][\w.\-]*\b"),
-    # The suffix must be introduced by `-`, so `o3` and `o3-deep-research-2025-06-26` match
-    # while `o3XPaKcS` does not: after `o3` comes a word character, so there is no `\b` for
-    # the bare alternative and no `-` for the suffixed one. `[M] 2026-08-31` that token is
-    # not hypothetical -- it is in this repo, in `.modelpin/drift_cache_drift-suite.json`.
-    re.compile(rf"\bo[{_O_SERIES_DIGITS}](?:-[\w.\-]*)?\b"),
+    _O_SERIES,
     re.compile(r"\bclaude-[\w.\-]+\b"),
     re.compile(r"\bgemini-[\w.\-]+\b"),
+    # The hosted-platform spellings of Claude, which the pattern above truncates: Vertex's
+    # `claude-haiku-4-5@20251001` and Bedrock's `us.anthropic.claude-sonnet-4-5-20250929-v1:0`.
+    # The truncated string is not an id either platform accepts, so `--to` needs the full one.
+    re.compile(r"\bclaude-[\w.\-]+@[0-9]{8}\b"),
+    re.compile(
+        r"\b(?:(?:us|eu|apac|au|ca|jp|global|us-gov)\.)?anthropic\.claude-[\w.\-]+\b(?::[0-9]+)?"
+    ),
+    # ---------------------------------------------------------------- MP-195, cross-vendor
+    # `[M] 2026-09-06` Until these existed, `mp scan` was OpenAI/Anthropic/Google-shaped, and
+    # cross-vendor is wedge item 3. A directory whose `app.py` named `llama-3.3-70b-versatile`,
+    # `qwen/qwen3-32b` and `openai/gpt-oss-20b` scanned to `No model identifiers found.`,
+    # exit 0 -- and appending a single line `M = "gpt-4o-mini"` to THAT SAME FILE produced a
+    # populated table. The same file was visible or invisible depending only on whose ids it
+    # held. `scan` is the first command of README's "real flow, on your own app", so a Groq or
+    # Together shop met a confident empty result rather than a hint that we did not cover them.
+    # These are also the exact ids README itself advertises (`llama-3.3-70b-versatile` at the
+    # cross-vendor table, `qwen/qwen3.8-27b` in a copy-pasteable example).
+    #
+    # `[M]` Measured over the same 6,228 third-party files under `site-packages` that MP-135
+    # used, so the false-positive claim is comparable to the one that narrowed the o-series:
+    #
+    #     llama      5 matches / 2 distinct  -> llama-3.1-8b-instruct,
+    #                                           llama-3.2-90b-vision-instruct-maas
+    #     meta-llama 0                       qwen/     1 -> qwen/qwen3
+    #     qwen<n>    2 -> qwen3, qwen3-4b    gpt-oss   0        mistral 0
+    #     deepseek   6 / 3 distinct          -> INCLUDED `deepseek-ai`, a FALSE POSITIVE:
+    #                                           it is the HuggingFace ORG, not a model.
+    #
+    # So `deepseek-` enumerates its real families instead of taking any suffix -- the same
+    # shape as `_O_SERIES_DIGITS` above, and for the same reason. Re-measured after narrowing:
+    # 3 matches / 2 distinct, both real, `deepseek-ai` gone, nothing else lost.
+    #
+    # `[M]` Case-insensitivity was measured, not assumed: `(?i)` on llama/qwen/mistral added
+    # **zero** new matches across those 6,228 files, so it is free here -- and it is needed,
+    # because HuggingFace writes `meta-llama/Llama-3.3-70B-Instruct` with a capital L while
+    # Groq writes the same family lowercase.
+    re.compile(r"(?i)\bllama-[0-9][\w.\-]*\b"),
+    re.compile(r"(?i)\bmeta-llama/[\w.\-]+\b"),
+    # `[M] 2026-09-15` Was `qwen/[\w.\-]+`, which reported `qwen/mistral` out of the prose
+    # "llama/qwen/mistral" in this module's own comment. Qwen's routed ids all name the family
+    # again after the slash (`qwen/qwen3-32b`, `Qwen/Qwen2.5-7B-Instruct`, `qwen/qwq-32b`).
+    re.compile(r"(?i)\bqwen/(?:qwen|qwq)[\w.\-]*\b"),
+    re.compile(r"(?i)\bqwen[0-9][\w.\-]*\b"),
+    re.compile(r"(?i)\b(?:openai/)?gpt-oss-[\w.\-]+\b"),
+    re.compile(r"(?i)\bmi[sx]tral-[\w.\-]+\b"),
+    re.compile(r"(?i)\bdeepseek-(?:r[0-9]|v[0-9]|chat|coder|reasoner)[\w.\-]*\b"),
+    # Families added 2026-09-15, each anchored on a version digit (or `-`) so the bare word
+    # never matches. The digit forms end at `-` or a boundary: `Llama4ForCausalLM` and
+    # `Gemma3ForCausalLM` are transformers class names, not ids, and have no boundary after
+    # the digit. `llama3.2` / `gemma2-9b-it` are the Ollama and Groq spellings.
+    re.compile(r"(?i)\bllama[0-9](?:\.[0-9])?(?:-[\w.\-]*)?\b"),
+    re.compile(r"(?i)\bgemma-?[0-9]n?(?:\.[0-9])?(?:-[\w.\-]*)?\b"),
+    re.compile(r"(?i)\b(?:codestral|ministral|magistral|devstral|pixtral)-[\w.\-]+\b"),
+    re.compile(r"(?i)\bgrok-[0-9][\w.\-]*\b"),
+    re.compile(r"(?i)\bkimi-k[0-9][\w.\-]*\b"),
 ]
 
-DEFAULT_EXTS = {".py", ".env", ".yaml", ".yml", ".json", ".toml", ".js", ".ts"}
+#: A lowercase substring every `MODEL_PATTERNS` match contains -- a line holding none of them
+#: cannot match, so it is skipped before any regex runs. A new pattern needs its key here, or
+#: it will never fire; the id lists in the detector tests are what catch that.
+_FAMILY_KEYS = (
+    "gpt-",
+    "o1",
+    "o3",
+    "o4",
+    "claude-",
+    "gemini-",
+    "llama",
+    "qwen",
+    "stral-",
+    "xtral-",
+    "deepseek-",
+    "gemma",
+    "grok-",
+    "kimi-",
+)
+
+#: OpenRouter / HuggingFace organisations whose `org/` prefix is part of the id a router
+#: accepts. Only ever PREPENDED to a match some pattern above already made, so `google/protobuf`
+#: or `openai/openai-python` can never become a model on the strength of the org alone.
+_VENDOR_PREFIX = re.compile(
+    r"(?i)(?<![\w.\-/])(?:anthropic|google|openai|meta-llama|mistralai|deepseek-ai|deepseek|"
+    r"qwen|moonshotai|x-ai|nvidia|microsoft|cohere|z-ai)/$"
+)
+
+#: `[M] 2026-09-15` A match ending in a file extension is a FILENAME: a first-run audit saw
+#: `gpt-4.1-mini-adr0040.jsonl` and `gemini-2.5-flash.txt` reported as models. Real ids never
+#: end in `.<letters>` -- their dots are version dots (`claude-sonnet-4.5`, `qwen3.8-27b`).
+_FILE_SUFFIX = re.compile(
+    r"\.(?:jsonl?|ndjson|txt|md|markdown|rst|csv|tsv|log|ya?ml|toml|ini|cfg|py|ipynb|[cm]?js|ts|"
+    r"html?|xml|css|pdf|png|jpe?g|gif|svg|webp|ico|bmp|mp4|gz|zip|parquet|pkl|db|sqlite|lock|"
+    r"out|diff|patch|sh|ps1|bat)$",
+    re.I,
+)
+
+#: `gemini-3.x`, `gpt-5.X`, `gemini-2.5-*`, `gpt-4*`: a family wildcard in prose, not an id.
+_WILDCARD_TAIL = re.compile(r"[.\-][xX]$")
+_WILDCARD_AFTER = re.compile(r"[.\-]?\*")
+
+#: What must sit right before a bare o-series id for it to count. See `_o_series_in_context`.
+_O_SERIES_KEY_BEFORE = re.compile(
+    r"""(?:(?i:model)[\w\-]*["']?\s*[:=]\s*|(?i:--(?:to|model))[\s=]+)$"""
+)
+_YAML_LIST_ITEM = re.compile(r"\s*-\s+")
+_CONTEXT_WINDOW = 48
+
+#: A URL anywhere on the line. MP-201: a model id INSIDE a URL is a link, not a dependency.
+#:
+#: `[M] 2026-09-07`, found by scanning a real repo (`faceanchor`) rather than a fixture. All
+#: **28** of its hits were fabricated, and all 28 came from URLs in scraped SerpAPI evidence:
+#:
+#:     gpt-56-sol                                          <- a percent-encoded Thai news slug
+#:     gpt-6-astra-its-latest-ai-modelthe-model-is-launch  <- an article headline slug
+#:     o4-AuaAAAAAElFTkSuQmCC.png                          <- base64 PNG data in a filename
+#:
+#: The third is MP-135's exact class (`o3XPaKcS`, a random cache token) arriving through a
+#: different door: narrowing the o-series digits could not help, because `o4` is a real model
+#: and `-Aua...` is a legal suffix. Only the CONTEXT distinguishes them.
+#:
+#: `[M]` Measured before shipping, over four real repos: faceanchor 28 hits -> 0, and
+#: **zero true positives lost** in VoiceRAG (31), kavach (16) or aegis (2), which kept 100%.
+#: Re-measured over the 6,228 `site-packages` files: no change.
+_URL_ON_LINE = re.compile(r"(?:https?://|www\.)\S+", re.I)
+
+
+#: Where a model id is WIRED UP: source and configuration the program actually reads.
+#: `[M] 2026-09-15` only `.js`/`.ts` covered the JavaScript family, so a Next.js or React app --
+#: whose model calls live in `.tsx`/`.jsx`/`.mjs` -- scanned as having no models at all. The
+#: other server languages are here for the same reason: a model id in a Go or Java service is
+#: exactly as wired-up as one in Python.
+CODE_EXTS = {
+    ".py", ".yaml", ".yml", ".json", ".toml",
+    ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".mts", ".cts",
+    ".go", ".rb", ".java", ".kt", ".cs", ".php", ".rs", ".swift",
+}  # fmt: skip
+
+#: The only `.env*` files `scan` opens. `[M] 2026-09-15` it opened every name starting with
+#: `.env` -- `.env`, `.env.local`, `.env.production` -- which is where live API keys live. A
+#: hit prints only a model id, but a first command has no business reading a secrets file;
+#: the committed template is the readable record of which model a repo uses.
+ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template"}
+
+
+def _is_secret_env(name: str) -> bool:
+    lower = name.lower()
+    is_env = lower == ".env" or lower.startswith(".env.") or lower.endswith(".env")
+    return is_env and lower not in ENV_TEMPLATE_NAMES
+
+
+class ScanRefusedError(ValueError):
+    """The user named a file `scan` will not read."""
+
+
+#: Generated files: a minifier's output and package-manager lockfiles. `[M] 2026-09-15` a
+#: first-run audit saw `src/bundle.min.js` holding `var o1=1,o3=3` reported as models `o1`
+#: and `o3`; a lockfile lists npm packages named after model families. Neither is the user's
+#: model choice, and the source they were built from is scanned anyway.
+_GENERATED_FILE = re.compile(
+    r"(?:[.\-]min|\.bundle|\.chunk)\.[cm]?js$|^(?:package-lock\.json|npm-shrinkwrap\.json|"
+    r"pnpm-lock\.yaml)$",
+    re.I,
+)
+
+#: Where a model id is TALKED ABOUT. MP-236's second half: `DEFAULT_EXTS` was `CODE_EXTS`
+#: alone, so a repo whose README says "we use `claude-3-5-sonnet` as a fallback" scanned to
+#: `No model identifiers found.`, exit 0 -- the same confident-empty-result shape MP-195 fixed
+#: for cross-vendor ids, arriving through the file walk instead of the patterns.
+#:
+#: `[M] 2026-09-09` Measured before adding, because docs are prose and prose is where a
+#: fabrication would come from. Two independent corpora, neither a fixture:
+#:
+#:     kavach (a real app, 9 doc files       5 new rows / 1 distinct -- `Llama-3.3-70B`,
+#:     actually walked)                      already found in `kavach/classifier.py`.
+#:                                           Models findable ONLY in its docs: NONE.
+#:     a site-packages tree (28 doc files)   9 matches / 2 distinct -- `claude-sonnet-5`,
+#:                                           `claude-haiku-4-5`, both real ids inside
+#:                                           `model="..."` samples. 0 fabricated.
+#:
+#: `[M] 2026-09-09` The counts above were first written as 27 and 156 and both were wrong, in
+#: the direction that overstates the check. 27 is the number of `.md` files ON DISK in kavach;
+#: the walker reaches 9, because `_is_virtualenv` prunes 18 inside `.venv-modelpin` and one in
+#: `.modelpin`. 156 reproduces on no tree on the machine. The RESULT columns are unchanged and
+#: were reproduced exactly -- only the denominator was invented, which is the half a reader
+#: would have trusted most.
+#:
+#: `.txt` is deliberately NOT here. It is not a documentation format, it is the default
+#: extension for logs, scraped dumps and data exports -- MP-201's 28 fabrications were
+#: exactly that kind of content. `[A]` Falsified by one real repo whose only record of its
+#: model is a `.txt`; add it then, with the measurement.
+DOC_EXTS = {".md", ".markdown", ".rst"}
+
+DEFAULT_EXTS = CODE_EXTS | DOC_EXTS
+
+#: Line-comment introducers, by extension. `.json` has none by design. Documentation
+#: formats are absent because they need no scanning: every line of prose is commentary.
+_COMMENT_TOKEN = {
+    ".py": "#",
+    ".yaml": "#",
+    ".yml": "#",
+    ".toml": "#",
+    ".env": "#",
+    ".js": "//",
+    ".ts": "//",
+    ".jsx": "//",
+    ".tsx": "//",
+    ".mjs": "//",
+    ".cjs": "//",
+    ".mts": "//",
+    ".cts": "//",
+    ".go": "//",
+    ".java": "//",
+    ".kt": "//",
+    ".cs": "//",
+    ".rs": "//",
+    ".swift": "//",
+    ".php": "//",
+    ".rb": "#",
+}
+
+#: Modelpin's own config, under both spellings YAML permits. Bound to the constant rather
+#: than typed, for the same reason `SKIP_DIRS` binds `STORE_DIRNAME`: renaming the file
+#: must not silently re-open MP-236.
+_OWN_CONFIG_NAMES = {DEFAULT_CONFIG_FILE.lower(), f"{Path(DEFAULT_CONFIG_FILE).stem.lower()}.yml"}
 #: Directory names never worth scanning, matched at or below the scan root. `.venv`/`venv`
 #: stay for the case a virtualenv has no `pyvenv.cfg` (a stale or hand-made one), but they
 #: are no longer what CARRIES the venv rule -- see `_is_virtualenv`.
-SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build"}
+SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    "dist",
+    "build",
+    # MP-200. Modelpin's OWN store. `[M] 2026-09-06`, found by scanning a real repo
+    # (`kavach`): **61 of 76 hits -- 80% of the table -- came from `.modelpin/baseline-*.json`**,
+    # the recorded traces of a previous run. `actions/README.md` tells users to `git add` that
+    # directory, so it is present in exactly the repos this command is aimed at.
+    #
+    # This is MP-134/MP-135's class one directory over: "scan reported 23 distinct models and
+    # only 2 were the user's own code". Reporting our own artifacts back to the user as their
+    # dependencies is the same defect wearing our own output.
+    #
+    # Bound to `STORE_DIRNAME` rather than typed, so renaming the store cannot silently
+    # re-open this.
+    STORE_DIRNAME,
+    # Front-end build output (minified chunks not named `.min.js`) and tool caches. Only
+    # dot-prefixed names: a plain `coverage/` or `out/` may be the user's own source.
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".vercel",
+    ".output",
+    ".parcel-cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+}
 #: Skipped wherever it appears. A dependency's source is not the user's model choice, and
 #: `[M] 2026-08-29` on a real app it was most of the answer: `modelpin scan` reported 23
 #: distinct "models" and only 2 were the user's own code -- the rest were Modelpin's own
@@ -65,34 +323,334 @@ def _iter_files(root: Path, exts: set[str]) -> Iterable[Path]:
     ADRs about. Walking from the root downward cannot express that bug: only directories at
     or below the root are ever considered.
     """
+    # MP-241. `[M] 2026-09-09` `os.walk`'s default `followlinks=False` is enforced through
+    # `DirEntry.is_symlink()`, which is FALSE for an NTFS junction -- and a junction needs no
+    # privilege to create. Reproduced: `vendor/` junctioned to a directory outside the repo
+    # reported `claude-3-5-sonnet in vendor\secret_project.py`, a file that is not in the
+    # repository at all; `is_symlink()` said False and `os.path.isjunction()` said True. The
+    # `SKIP_DIRS` name match is a filter, not a boundary, so a `.git` re-exposed under another
+    # name was walked too.
+    #
+    # Bounded, and the bound is load-bearing: hits carry only `{model, file, line, context}`
+    # and are printed to the user's own terminal, so this leaked filenames and existence,
+    # never content, and nothing left the machine. It is fixed because `scan` must not report
+    # files that are not in the repo it was pointed at.
+    #
+    # The boundary is the REAL path, resolved once for the root and checked for every
+    # directory before descending and for every link-typed file before reading. That covers
+    # junctions, directory symlinks and file symlinks with one rule, and keeps a symlink that
+    # points somewhere INSIDE the repo -- a monorepo's shared package -- working as before.
+    root_real = os.path.normcase(os.path.realpath(root))
+
+    def _inside(p: Path) -> bool:
+        real = os.path.normcase(os.path.realpath(p))
+        return real == root_real or real.startswith(root_real + os.sep)
+
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in SKIP_DIRS and d not in SKIP_DIRS_ANY_DEPTH and not _is_virtualenv(here / d)
+            if d not in SKIP_DIRS
+            and d not in SKIP_DIRS_ANY_DEPTH
+            and not _is_virtualenv(here / d)
+            and _inside(here / d)
         ]
         for name in filenames:
             p = here / name
-            if p.suffix.lower() in exts or p.name == ".env":
+            # A regular file can only escape if its directory did, and directories are pruned
+            # above -- so only a LINK needs its real path checked, which keeps the cost off
+            # the ordinary case.
+            if (p.is_symlink() or os.path.isjunction(p)) and not _inside(p):
+                continue
+            if _is_secret_env(name) or _GENERATED_FILE.search(name):
+                continue
+            # MP-195. `.env` was matched by exact name, so `.env.example` -- the file a repo
+            # commits precisely BECAUSE it is the readable record of which model it uses --
+            # was invisible. `Path(".env.example").suffix` is `.example`, so the extension
+            # test cannot see it either.
+            if p.suffix.lower() in exts or name.lower() in ENV_TEMPLATE_NAMES:
                 yield p
 
 
-def scan_repo(root: str | Path = ".", exts: set[str] | None = None) -> list[dict]:
-    """Return [{model, file, line}] for every model id found in the repo."""
+def _comment_cut(line: str, token: str) -> int:
+    """Index where `line`'s trailing comment begins, or `len(line)` if it has none.
+
+    Quoted spans are skipped, so ``MODEL = "gpt-4o"  # or gpt-5`` cuts at the `#` and
+    ``url = "https://x/#gpt-4"`` does not cut at all. That is the whole ambition: this is a
+    one-line lexer, not a parser for eight languages.
+
+    Two bounds, stated because they are load-bearing nowhere else and must stay that way:
+    a model id inside a Python docstring reads as code (line-based scanning cannot see a
+    multi-line string), and an unbalanced apostrophe in unquoted YAML prose -- `dont` vs
+    `don't` -- swallows the rest of the line, so a real comment after it reads as code.
+    BOTH degrade toward "call it code", which keeps the row. The only place that choice can
+    delete anything is Modelpin's own config, whose generated comments start at column 0
+    where no quote precedes them.
+    """
+    quote = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif line.startswith(token, i):
+            return i
+        i += 1
+    return len(line)
+
+
+#: MP-242. A file larger than this is not read. `[M] 2026-09-09` security review: there was
+#: no guard at all -- a 200 MB file took 246 s and a 497 MB one was read whole into memory.
+#: Source files and configuration are rarely past a megabyte; what lives above this is a
+#: bundle, a lockfile, a dataset or a log. It is disclosed, never silent: a skipped file
+#: could hold a model id, and `scan` must not imply it looked where it did not.
+MAX_SCAN_BYTES = 5 * 1024 * 1024
+
+
+def scan_repo(
+    root: str | Path = ".",
+    exts: set[str] | None = None,
+    skipped: list[str] | None = None,
+    scanned: list[str] | None = None,
+) -> list[dict]:
+    """Return [{model, file, line, context}] for every model id found in the repo.
+
+    `root` may be a directory or a single file. A named file is read whatever its extension
+    -- the user chose it -- except a secrets `.env`, which raises `ScanRefusedError`. A path
+    that does not exist raises `FileNotFoundError`: `[M] 2026-09-15` it walked nothing and
+    returned `[]`, so `modelpin scan does-not-exist-dir` printed "No model identifiers found."
+    and exited 0 -- a typo indistinguishable from a clean repo. `scanned`, when given,
+    receives every file actually read, so "found nothing" can say how much it looked at.
+
+    `context` is `"code"` (the id is wired up: source, or an active config value) or
+    `"comment"` (the id is talked about: a code comment, or documentation prose).
+
+    MP-236. `[M] 2026-09-09`, found by a first-run audit of the published 0.3.0 and
+    reproduced verbatim in a directory holding one 1-file app plus a fresh `modelpin init`:
+    **3 of 6 rows, and 1 of 3 "distinct model(s)", were Modelpin talking to itself.**
+    `qwen/qwen3.8-27b` was reported as a dependency of the user's app; it exists nowhere in
+    that app, only inside the scaffold comment `modelpin init` had just written explaining the
+    judge-model-collision rule. This is MP-200's class (our `.modelpin/` store reported back
+    as the user's models) in the one file we write into the user's repo by hand, and it lands
+    on the first command a stranger runs.
+
+    The rule is structural, NOT a copy of the scaffold's text: **in Modelpin's own config, a
+    model id outside an active setting is commentary, not a declaration.** We define that
+    file's schema, and `models:` / `judge_model:` is the only way to declare a model in it --
+    so a commented-out `judge_model:` is a DISABLED one, and prose about a model is not a
+    dependency. Matching the template's wording instead would put a second copy of it in this
+    module (MP-03's exact defect) and would fail silently the day `modelpin init`'s wording changes.
+
+    Comments elsewhere are KEPT and labelled, not suppressed. `# TODO: evaluate gpt-5.5` in
+    the user's own app is a model that repo has a relationship with, and the audit read it as
+    a true positive; a commented-out `MODEL = "gpt-4o"` is the same. `context` is what lets
+    `modelpin scan` print those in their own group later -- rendering it is the CLI's half of this
+    row and is not done here.
+
+    `[M]` Measured on `C:/dev/kavach`, a real repo carrying a hand-edited `modelpin.yaml`, so
+    the cost of the rule is stated rather than assumed: **15 rows / 6 distinct -> 14 / 5**.
+    The one dropped row is `llama-3.3-70b-versatile` in a hand-written NOTE that says Groq
+    RETIRED it -- prose about a dead model, reported until now as a live dependency. That is
+    the shape of what this rule deletes, and one sample is the bound: `[A]` a user who keeps
+    their real model id ONLY in a modelpin.yaml comment loses a row. They would have to have
+    commented out the setting that names it, which is how you turn it off.
+    """
     root = Path(root)
     exts = exts or DEFAULT_EXTS
+    if not root.exists():
+        raise FileNotFoundError(str(root))
+    files: Iterable[Path]
+    if root.is_file():
+        if _is_secret_env(root.name):
+            raise ScanRefusedError(
+                f"{root.name} is not read: it may hold secrets. "
+                "Scan a committed .env.example instead."
+            )
+        files, base = [root], root.parent
+    else:
+        files, base = _iter_files(root, exts), root
     hits: list[dict] = []
-    for f in _iter_files(root, exts):
+    for f in files:
+        rel = str(f.relative_to(base))
         try:
-            text = f.read_text(errors="ignore")
+            # Checked by `stat` BEFORE reading, so an oversized file is never loaded. The
+            # caller learns about it through `skipped`, because a scan that quietly looked
+            # past a file would be claiming a coverage it did not have.
+            if f.stat().st_size > MAX_SCAN_BYTES:
+                if skipped is not None:
+                    skipped.append(rel)
+                continue
+            # MP-190's class, in the one site its sweep missed: `errors="ignore"` without
+            # `encoding=` matched neither `read_text()` nor `read_text(encoding=` in that
+            # commit's grep, so its claim that the two sites it fixed were "the ONLY two
+            # text-I/O sites in modelpin/ without an explicit encoding" was wrong. Here the
+            # consequence is a silent MISS rather than a wrong verdict: on a cp1252 machine a
+            # UTF-8 source file decodes to mojibake and its model ids stop matching.
+            text = f.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        if scanned is not None:
+            scanned.append(rel)
+        # `.env.example` and friends: `Path(".env.example").suffix` is `.example`, the same
+        # blind spot `_iter_files` documents, so the key is derived the same way there.
+        suffix = ".env" if f.name.lower() in ENV_TEMPLATE_NAMES else f.suffix.lower()
+        token = _COMMENT_TOKEN.get(suffix)
+        own_config = f.name.lower() in _OWN_CONFIG_NAMES
         for i, line in enumerate(text.splitlines(), start=1):
-            for pat in MODEL_PATTERNS:
-                for m in pat.findall(line):
-                    hits.append({"model": m, "file": str(f.relative_to(root)), "line": i})
+            # The judge is Modelpin's own tooling, not a model the app calls. `modelpin init`
+            # writes an independent judge, so counting it would make the scaffold add a model
+            # to "what does this repo use?" that the app never touches.
+            if own_config and line.lstrip().startswith("judge_model:"):
+                continue
+            # A documentation file is commentary end to end, so the cut is 0. A format with
+            # no line comment (`.json`) has no cut at all.
+            cut = 0 if suffix in DOC_EXTS else (_comment_cut(line, token) if token else len(line))
+            for model, start in _models_in(line):
+                context = "code" if start < cut else "comment"
+                if own_config and context == "comment":
+                    continue
+                hits.append(
+                    {
+                        "model": model,
+                        "file": rel,
+                        "line": i,
+                        "context": context,
+                    }
+                )
     return hits
+
+
+def _is_path_segment(line: str, start: int, end: int) -> bool:
+    """Is the id at `line[start:end]` a directory name -- `runs/gpt-4o/summary.json`?
+
+    A `/` AFTER an id makes it a path segment. `openai/gpt-4o` is untouched (the separator is
+    before), and so is prose listing alternatives, `gpt-4o/claude-3-5-sonnet`: when another id
+    starts right after the slash, the slash is an "or", not a directory. A `\\` counts only
+    between two separators (`runs\\gpt-4o\\x`), because after a bare id it is far more often a
+    string escape: `"model: gpt-4o\\n"`.
+    """
+    if line.startswith("\\", end):
+        return start > 0 and line[start - 1] in "/\\"
+    if not line.startswith("/", end):
+        return False
+    return not any(p.match(line, end + 1) for p in MODEL_PATTERNS)
+
+
+def _o_series_in_context(line: str, start: int) -> bool:
+    """Does the text before a bare `o1`/`o3`/`o4...` show it is a model id?
+
+    `[M] 2026-09-15` A first-run audit saw `var o1=1,o3=3` in `src/bundle.min.js` reported as
+    two models, and MP-246 reported `o4` the same way: minifiers name locals `o1`/`o3`/`o4`,
+    and in minified code "o4 minus e" is written with a hyphen. Two characters of shape cannot separate those
+    from the model; the text before them can. It counts after a quote or backtick (a string
+    literal, a JSON value, Markdown code), after a `model...=` / `model...:` key (`.env`,
+    YAML), after `--to` / `--model`, or as a YAML list item (`models:` in our own config).
+
+    The cost, stated: an o-series id in unquoted prose -- "we moved to o3-mini" -- is no longer
+    reported, and that is a Markdown mention, never a call. The check reads a bounded window,
+    so a 64 KB single-line bundle stays linear.
+    """
+    before = line[max(0, start - _CONTEXT_WINDOW) : start]
+    if before.endswith(('"', "'", "`")) or _O_SERIES_KEY_BEFORE.search(before):
+        return True
+    return start <= _CONTEXT_WINDOW and _YAML_LIST_ITEM.fullmatch(before) is not None
+
+
+def _models_in(line: str) -> list[tuple[str, int]]:
+    """Every model id on one line as `(id, start)`, with substring matches of a longer id
+    dropped.
+
+    The start offset exists so `scan_repo` can ask which side of a comment marker the id sits
+    on. It is the LEFTMOST occurrence's offset, because the dedupe below keeps the first hit
+    of an id on a line: ``MODEL = "gpt-4o"  # gpt-4o stays`` is one row, `code`, exactly as
+    it was one row before this offset existed. Reporting the same id twice on one line to
+    label it twice would answer a noise row with two.
+
+    MP-195. The vendor-prefixed patterns overlap the bare ones by construction -- `qwen/` and
+    `qwen<n>` both fire on ``qwen/qwen3-32b`` -- so without this the fix for scan's BLINDNESS
+    would have shipped a new case of scan's NOISE (MP-10): `[M] 2026-09-06` a file naming four
+    models reported five rows, listing `qwen3-32b` beside the `qwen/qwen3-32b` it is part of.
+
+    Containment, not de-duplication by string: two genuinely different ids on one line must
+    both survive, and they do -- only a span strictly inside another span is dropped. The
+    longest match wins because a vendor-qualified id is the one the user can actually pass to
+    `--to`; the bare tail is an artifact of our patterns, not something they wrote.
+    """
+    # Most lines name no model. Substring tests are far cheaper than ~20 regex passes, and
+    # `[M] 2026-09-15` without this the added patterns made a scan of this repo ~50% slower.
+    low = line.lower()
+    if not any(key in low for key in _FAMILY_KEYS):
+        return []
+    # `finditer` returns non-overlapping URLs in order, so the only URL that can contain a
+    # match is the last one starting at or before it -- a binary search, not a scan of all.
+    urls = [(u.start(), u.end()) for u in _URL_ON_LINE.finditer(line)]
+    url_starts = [s for s, _ in urls]
+    spans: list[tuple[int, int, str]] = []
+    for pat in MODEL_PATTERNS:
+        for m in pat.finditer(line):
+            # MP-201. A model id inside a URL is a link, not a dependency, and a filename is
+            # not a model. Both are FABRICATIONS -- the north-star failure in the first command
+            # a stranger runs -- and neither can be excluded by narrowing the patterns, because
+            # `o4-...` and `gpt-6-...` are legal shapes for a real id. Only the surrounding
+            # context separates them. Filenames, paths and wildcards are DROPPED rather than
+            # labelled `comment`: a `comment` row is a model the repo talks about, and
+            # `gpt-4.1-mini-adr0040.jsonl` is not a model at all -- listing it even as a
+            # mention puts a non-id in the table and its count.
+            start, end, text = m.start(), m.end(), m.group(0)
+            i = bisect.bisect_right(url_starts, start) - 1
+            if i >= 0 and end <= urls[i][1]:
+                continue
+            if _FILE_SUFFIX.search(text) or _is_path_segment(line, start, end):
+                continue
+            if _WILDCARD_TAIL.search(text) or _WILDCARD_AFTER.match(line, end):
+                continue
+            if pat is _O_SERIES and not _o_series_in_context(line, start):
+                continue
+            vendor = _VENDOR_PREFIX.search(line[max(0, start - _CONTEXT_WINDOW) : start])
+            if vendor:
+                start -= len(vendor.group(0))
+            spans.append((start, end, line[start:end]))
+    # MP-242. `[M] 2026-09-09` This compared every span with every other span on the line --
+    # O(S^2) -- and a minified bundle is ONE enormous line. Minifiers emit `o1`/`o3`/`o4` as
+    # short local names, which the o-series pattern matches at every word boundary, so a
+    # bundle is dense with spans: reproduced at 4 KB -> 0.03 s, 8 KB -> 0.10 s, 16 KB ->
+    # 0.56 s, quadrupling per doubling, and the security review measured a 96 KB file at 105 s.
+    # Every JS/TS repository has a bundle, so for a front-end shop the tool's first command
+    # appeared to hang.
+    #
+    # Sorting by (start asc, end desc) puts every span that could contain another BEFORE it,
+    # so one sweep tracking the furthest end seen answers containment for all of them. The
+    # only span that sweep can mis-call is one at exactly the same position as an earlier
+    # span -- which is the same text, and `seen` drops it either way -- so the output is
+    # identical to the quadratic version's, set and order both, and a property test holds
+    # that on random inputs rather than asserting it here.
+    return _dedupe_spans(spans)
+
+
+def _dedupe_spans(spans: list[tuple[int, int, str]]) -> list[tuple[str, int]]:
+    """Drop every span strictly contained in a longer one, then repeated texts; keep order.
+
+    Extracted from `_models_in` (MP-242) so `tests/test_scan_performance.py` can hold it
+    against the original quadratic definition on random inputs. The claim that the two agree
+    exactly is the whole safety argument for the speed-up, so it is tested, not asserted.
+    """
+    out: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    furthest = -1
+    for start, end, text in sorted(spans, key=lambda s: (s[0], -s[1])):
+        contained = furthest >= end
+        furthest = max(furthest, end)
+        if not contained and text not in seen:
+            seen.add(text)
+            out.append((text, start))
+    return out
 
 
 def models_used(root: str | Path = ".") -> set[str]:

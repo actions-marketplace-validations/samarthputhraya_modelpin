@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 from modelpin.models import IncompleteReason, Scenario, ToolCall, Trace
-from modelpin.providers._common import looks_like_refusal, scrub_secrets
+from modelpin.providers._common import elide, looks_like_refusal, scrub_secrets
 from modelpin.providers.base import ProviderAdapter, ProviderError
 
 #: Generation params we pass through from ``scenario.input`` when present. Anything
@@ -154,7 +154,7 @@ def _explain_api_error(
             else ""
         )
         return f"{base} [{name}].{where}"
-    detail = scrub_secrets(str(exc))[:300]
+    detail = elide(scrub_secrets(str(exc)))
     return f"{base} [{name}: {detail}]."
 
 
@@ -228,7 +228,10 @@ def _parse_tool_calls(message: Any) -> list[ToolCall]:
     for call in raw_calls:
         fn = getattr(call, "function", None)
         name = getattr(fn, "name", None)
-        if not name:
+        if fn is None or not name:
+            # `fn is None` is already covered by `not name` -- `getattr(None, "name", None)`
+            # is None -- but saying it lets the reader and the type checker see that
+            # `fn.arguments` below cannot be reached on a call with no `function`.
             continue  # partial/malformed call — skip rather than crash the whole run
         try:
             raw_args = fn.arguments
@@ -322,7 +325,7 @@ def build_openai_client(
         from openai import OpenAI
     except ImportError as exc:  # optional dependency
         raise ProviderError(
-            "The OpenAI SDK is not installed. Install it with: pip install 'modelpin[providers]'"
+            'The OpenAI SDK is not installed. Install it with: pip install "modelpin[providers]"'
         ) from exc
     kwargs: dict[str, Any] = {"api_key": api_key, "max_retries": max_retries}
     if base_url:
@@ -332,6 +335,8 @@ def build_openai_client(
 
 class OpenAIAdapter(ProviderAdapter):
     name = "openai"
+    #: The SDK client is thread-safe, so `replay` may send a scenario's runs together.
+    parallel_safe = True
 
     def __init__(
         self,

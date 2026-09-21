@@ -618,10 +618,28 @@ def test_the_recall_arm_publishes_only_through_the_pinned_helpers():
     # the selection sits above the marker and the assertion is satisfied by the unrelated
     # `PERTURBATIONS[s.id]` lookup inside the comprehension. `perturbed = []` survived all
     # 72 tests in FP review's mirror.
-    assert "for s in scenarios if s.id in PERTURBATIONS" in inspect.getsource(main), (
-        "main() no longer selects the perturbed scenarios from PERTURBATIONS. An empty "
-        "selection is the one remaining way to make this arm report 0/0 - loud rather than "
-        "silent (the CHECKED NOTHING banner fires), but nothing below main() can see it."
+    #
+    # `[M] 2026-09-09` This used to pin the literal `PERTURBATIONS`, and that turned out to
+    # be pinning the wrong noun. MP-224's labelled corpus keeps its ground truth in
+    # `examples/calibration/tool/labels.json`, which this module never read, so on the first
+    # paid run of that set all 19 `changed` pairs were invisible and the arm printed
+    # `Detection: 0/0` beside a healthy-looking false-positive rate. The banner fired exactly
+    # as designed; what it could not say was that the SELECTION SOURCE was incomplete. So the
+    # selection now reads a per-corpus map and the assertion pins BOTH halves: that main()
+    # still selects on that map, and that the map is still loaded from the corpus rather than
+    # quietly reverting to the module-level dict.
+    main_src = inspect.getsource(main)
+    assert "for s in scenarios if s.id in perturbations" in main_src, (
+        "main() no longer selects the perturbed scenarios from the loaded perturbation map. "
+        "An empty selection is the one remaining way to make this arm report 0/0 - loud "
+        "rather than silent (the CHECKED NOTHING banner fires), but nothing below main() can "
+        "see it."
+    )
+    assert "load_perturbations(" in main_src, (
+        "main() no longer loads the perturbation map from the corpus. A labelled set whose "
+        "labels.json is not read reports 0/0 detections while its false-positive half looks "
+        "healthy - which is how MP-224's corpus ran 35 trials and measured no detection at "
+        "all."
     )
     assert "_perturb(" in arm, "the candidate side is no longer perturbed at all"
     names = _called_names(main)
@@ -961,37 +979,32 @@ def test_the_whole_document_uses_perturbation_vocabulary_not_regression():
         )
 
 
-_README = Path(__file__).resolve().parent.parent / "README.md"
+_FP_DOC = Path(__file__).resolve().parent.parent / "docs" / "fp-measurement.md"
 
 
-def test_the_readme_publishes_the_same_detection_fraction_as_the_harness():
-    """`README.md` is the surface most readers meet, and nothing guarded it.
+def test_the_published_detection_fraction_is_the_harness_s():
+    """The detection fraction and its bound, wherever they are published, are the harness's.
 
-    `[M]` claims review 2026-08-24, second pass: seven separate edits to `README.md` each
-    left the whole suite green - including `2 of 3` -> `3 of 3`, restoring the withdrawn
-    `22.4% at 2/2` interval, deleting the withdrawal paragraph outright, and a `299 tests
-    passing` line that was 40 short of the real count. Two of those were real staleness this
-    change had to fix by hand, which is the argument for pinning at least the number the whole
-    correction is about.
-
-    Scoped deliberately to the detection fraction and the withdrawal's existence. Guarding
-    every claim in a README from a unit test is the wrong shape; MP-85 covers the rest.
+    `[M]` claims review 2026-08-24: seven separate edits to the published numbers each left the
+    suite green -- including `2 of 3` -> `3 of 3` and restoring the withdrawn `2/2` reading.
+    2026-09-15: the README became a stranger's guide and no longer restates these numbers; it
+    links to `docs/fp-measurement.md`, so that is the surface pinned here. The README must not
+    grow a copy the guard cannot see.
     """
-    text = _README.read_text(encoding="utf-8")
+    doc = _FP_DOC.read_text(encoding="utf-8")
     t = recall_tally(_doc_run_of_record(_doc_detection_section()))
-
-    assert f"**{t['detected']} of {t['checked']}** injected perturbations were flagged" in text, (
-        f"README.md must publish the same {t['detected']} of {t['checked']} the harness "
-        "computes and docs/fp-measurement.md quotes. It is the project's only surviving "
-        "quantitative DoD claim and the surface most readers meet first."
+    assert f"{t['detected']} of {t['checked']} injected perturbations were flagged" in doc, (
+        f"docs/fp-measurement.md must publish the same {t['detected']} of {t['checked']} the "
+        "harness computes."
     )
     bound = f"{1 - upper_bound_95(t['checked'] - t['detected'], t['checked']):.1%}"
-    assert (
-        f"**{bound}**" in text
-    ), f"README.md must publish the exact one-sided 95% lower bound {bound}."
-    assert "is **withdrawn**" in text, (
-        "README.md no longer withdraws the 2/2 reading. A withdrawal that can be deleted "
-        "silently is not a withdrawal."
+    assert f"**{bound}**" in doc, f"docs/fp-measurement.md must publish the exact bound {bound}."
+    assert "withdrawn `2/2`" in doc, "the 2/2 reading's withdrawal must stay published"
+
+    readme = (_FP_DOC.parent.parent / "README.md").read_text(encoding="utf-8")
+    assert "injected perturbations" not in readme, (
+        "README.md restates a detection number again; publish it in docs/fp-measurement.md, "
+        "where this guard reads it, and link to it."
     )
 
 
@@ -1033,46 +1046,4 @@ def test_the_doc_states_the_recall_arms_one_exclusion_correctly():
         "section that says the arm excludes NOTHING is false in the loosening direction, "
         "and invites deleting the abstention block that this file's header records "
         "surviving 302 green tests."
-    )
-
-
-def test_the_readmes_test_count_is_the_real_one():
-    """`[M]` This number drifted 42 in production - `README.md` published `299 tests passing`
-    against an actual 341, across multiple releases, and MP-81 had to correct it by hand.
-
-    It is the cheapest possible claim for a reader to check and the one most likely to be
-    quietly wrong, which is exactly the combination that costs credibility.
-
-    `[M] 2026-08-26` It went wrong a second way, in the flattering direction, and this guard
-    permitted it: the README said `461 tests passing` while `pytest -q` reported **458 passed,
-    3 xfailed**. Three `xfail(strict=True)` markers pin an OPEN defect (the MP-05 scenario-id
-    collision) -- they are not passes, and publishing them as passes overstates the suite by
-    exactly the count of the bugs it has conceded. Comparing the claim to `collected` could
-    never see that. The README now publishes BOTH numbers and this guard checks the
-    arithmetic between them, without re-running the suite inside the suite.
-    """
-    import subprocess
-
-    root = Path(__file__).resolve().parent.parent
-    out = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    ).stdout
-    collected = int(re.search(r"(\d+) tests? collected", out).group(1))
-
-    text = (root / "README.md").read_text(encoding="utf-8")
-    claimed = re.search(r"\*\*(\d+) tests passing\*\*", text)
-    assert claimed, "README.md no longer states a test count"
-    xfailed = re.search(r"\+(\d+) `xfail`", text)
-    assert xfailed, (
-        "README.md states a passing count but no longer states the xfail count. Both are "
-        "required: an xfail pins an OPEN defect and must never be published as a pass."
-    )
-    assert int(claimed.group(1)) + int(xfailed.group(1)) == collected, (
-        f"README.md claims {claimed.group(1)} passing + {xfailed.group(1)} xfailed = "
-        f"{int(claimed.group(1)) + int(xfailed.group(1))}; pytest collects {collected}. "
-        "This exact number was 42 short for several releases before MP-81 caught it, and "
-        "3 too high in the flattering direction before MP-112 caught it."
     )
