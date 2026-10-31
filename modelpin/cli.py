@@ -16,9 +16,10 @@ import json
 import os
 import shlex
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Mapping, Sequence, Set as AbstractSet
+from collections.abc import Callable, Mapping, Sequence, Set as AbstractSet
 from typing import IO, Any, NoReturn, Optional, cast
 
 import typer
@@ -26,14 +27,16 @@ from pydantic import ValidationError
 from rich.box import ASCII as ASCII_BOX
 from rich.console import Console
 from rich.markup import escape as _rich_escape
-from rich.table import Table
+from rich.table import Column, Table
 from rich.text import Text
 
 from modelpin import __version__
+import modelpin.watcher as watcher_mod
 from modelpin.config import (
     DEFAULT_CONFIG_FILE,
     DEFAULT_PROVIDER,
     DEFAULT_RUNS,
+    REASONING_EFFORTS,
     ConfigError,
     ModelpinConfig,
     load_config,
@@ -64,17 +67,30 @@ from modelpin.diff.stats import (
 from modelpin.models import MATCH_MODES, Assertion, DiffResult, DiffVerdict, Scenario, Trace
 from modelpin.providers import ProviderAdapter, ProviderError, get_adapter, provider_help
 from modelpin.providers.fake import FakeProvider
-from modelpin.providers.openai import MAX_TOOL_TURNS
+from modelpin.providers.openai import (
+    MAX_TOOL_TURNS,
+    OPENAI_COMPATIBLE_PROVIDERS,
+    OpenAIAdapter,
+    _is_reasoning_model,
+    _tools_need_reasoning_off,
+)
 from modelpin.replay import replay
 from modelpin.report import (
     ChannelCensus,
     ReportMeta,
+    _md_code,
     render_cli,
     render_pr_comment,
     render_report_md,
     to_report_sidecar,
 )
 from modelpin.report.evidence import Example, pick_examples
+from modelpin.report.migration import (
+    MIGRATION_REPORT_FILENAME,
+    MigrationFacts,
+    render_migration_report,
+)
+from modelpin.report.reasoning import ReasoningDisclosure, reasoning_disclosure
 from modelpin.report.suite import (
     compute_suite_hash,
     read_manifest,
@@ -91,6 +107,16 @@ from modelpin.scaffold import (
     sdk_installed,
 )
 from modelpin.scenarios.starter import AGENT_STARTER_FILENAME, write_agent_starter
+from modelpin.watcher import (
+    REGISTRY_SCHEMA,
+    Declared,
+    RegistryError,
+    WatchRow,
+    assess,
+    load_registry,
+    newest_fetch,
+    watch_exit_code,
+)
 from modelpin.storage import (
     STORE_DIRNAME,
     ensure_store,
@@ -283,6 +309,43 @@ def _adapter(provider: str, fixtures: Optional[str]) -> ProviderAdapter:
         _fail(str(exc))
 
 
+def _resolve_reasoning_effort(
+    flag: Optional[str], cfg: ModelpinConfig, provider: str
+) -> Optional[str]:
+    """`--reasoning-effort`, else `reasoning_effort:` in modelpin.yaml, else None (MP-153).
+
+    Printed when set, and when the provider will not use it: the setting reaches OpenAI
+    reasoning models only, and a check that silently ignored it would measure a configuration
+    the user did not ask for while they believed otherwise."""
+    if flag is not None and flag not in REASONING_EFFORTS:
+        _fail(
+            f"--reasoning-effort must be one of {', '.join(REASONING_EFFORTS)} " f"(got {flag!r})."
+        )
+    effort = flag if flag is not None else cfg.reasoning_effort
+    if effort is None:
+        return None
+    if provider != "openai" and provider not in OPENAI_COMPATIBLE_PROVIDERS:
+        console.print(
+            f"[yellow]note:[/] reasoning_effort={_rich_escape(effort)} is sent only to OpenAI "
+            f"reasoning models (gpt-5.x, gpt-6, o-series); the {_rich_escape(provider)} adapter "
+            f"does not send it."
+        )
+    else:
+        console.print(
+            f"[dim]reasoning_effort={_rich_escape(effort)}: sent to reasoning models only "
+            f"(gpt-5.x, gpt-6, o-series), never to other models.[/]"
+        )
+    return effort
+
+
+def _with_reasoning_effort(adapter: ProviderAdapter, effort: Optional[str]) -> ProviderAdapter:
+    """Hand the run's `reasoning_effort` to the OpenAI adapter (and the hosts it drives);
+    every other adapter has no such setting, which `_resolve_reasoning_effort` already said."""
+    if isinstance(adapter, OpenAIAdapter):
+        adapter.reasoning_effort = effort
+    return adapter
+
+
 def _unimplemented_msg(provider: str) -> str:
     return (
         f"the {provider!r} adapter isn't implemented yet. Try `--provider fake "
@@ -405,6 +468,93 @@ def _replay_plan(
         judged = sum(b * max(b - 1, 0) + runs * b for b in depths)
         plan += f" + up to {judged} judge calls"
     return plan
+
+
+class _CountingJudge:
+    """A judge that counts its calls and changes nothing else.
+
+    The migration report states how many judge calls a check made. The judge classes keep no
+    count, and the diff engine must not change (ADR-0047), so the count is taken here, at the
+    one place `check` hands the judge to the engine. Every attribute reads through, including
+    ``parallel_safe``, which decides whether the engine judges runs concurrently.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def equivalent(self, reference: str, candidate: str, task: Optional[str] = None) -> bool:
+        with self._lock:
+            self.calls += 1
+        return bool(self._inner.equivalent(reference, candidate, task))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _write_migration_report(
+    results: list[DiffResult],
+    *,
+    store_dir: str,
+    from_model: str,
+    to_model: str,
+    provider: Optional[str],
+    runs: int,
+    match_mode: str,
+    judge: Any,
+    judge_model: Optional[str],
+    confirm: bool,
+    baseline_counts: Sequence[int],
+    candidate_runs: Mapping[str, list[Trace]],
+    underpowered: Sequence[str] = (),
+    census: Any = None,
+    rejected: Sequence[tuple[str, str]] = (),
+    skipped: Sequence[str] = (),
+    examples: Optional[Mapping[str, tuple[Example, Example]]] = None,
+    reasoning: Optional[ReasoningDisclosure] = None,
+) -> str:
+    """Write `migration-report.md` beside `last-report.md`; return the note to print.
+
+    A failure to write it is reported and never changes the exit code, for the reason
+    `_publish_report` gives: a report-write failure must not mask a real regression.
+    """
+    traces = [t for runs_ in candidate_runs.values() for t in runs_]
+    facts = MigrationFacts(
+        date_iso=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        from_model=from_model,
+        to_model=to_model,
+        provider=provider,
+        runs=runs,
+        match_mode=match_mode,
+        modelpin_version=__version__,
+        judge_model=judge_model if judge is not None else None,
+        baseline_runs=sum(baseline_counts),
+        candidate_runs=len(traces),
+        judge_calls=getattr(judge, "calls", None) if judge is not None else None,
+        tokens_in=sum(t.tokens_in for t in traces),
+        tokens_out=sum(t.tokens_out for t in traces),
+        confirm=confirm,
+        baseline_counts=tuple(sorted(set(baseline_counts))),
+        reasoning_note=reasoning.note if reasoning is not None else None,
+        reasoning_off_for_tools=reasoning.reasoning_off_for_tools if reasoning is not None else (),
+    )
+    text = render_migration_report(
+        results,
+        facts,
+        underpowered=underpowered,
+        census=census,
+        rejected=rejected,
+        skipped=skipped,
+        examples=examples,
+    )
+    path = Path(store_dir) / MIGRATION_REPORT_FILENAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return f"[yellow]note:[/] could not write the migration report: {_rich_escape(str(exc))}"
+    return f"[dim]Migration report for a non-engineering reader: {_rich_escape(str(path))}[/]"
 
 
 def _build_judge(
@@ -1044,6 +1194,305 @@ def _print_scan_skips(skipped: list[str]) -> None:
     )
 
 
+def _watch_is_chat(row: WatchRow) -> bool:
+    """Modelpin compares chat behaviour; an image or audio model gets no check suggested."""
+    return row.model is None or row.model.modality == "chat"
+
+
+def _watch_check_command(row: WatchRow) -> Optional[str]:
+    """The exact `modelpin check` line for an affected row, or the judge remedy."""
+    if not row.replacement_id or not _watch_is_chat(row):
+        return None
+    if row.role == "judge":
+        return f"set judge_model: {row.replacement_id} in modelpin.yaml"
+    cmd = f"modelpin check --from {row.id} --to {row.replacement_id}"
+    if row.model is not None and row.replacement_provider not in (None, row.model.provider):
+        cmd += f" --provider {row.replacement_provider}"
+    return cmd
+
+
+def _watch_branch(row: WatchRow) -> Optional[str]:
+    """The branch name a pull-request workflow would use for this migration, if one applies."""
+    if not row.replacement_id or row.role != "app" or not _watch_is_chat(row):
+        return None
+    return f"modelpin/migrate-{slug(row.id)}-to-{slug(row.replacement_id)}"
+
+
+def _watch_source_line(row: WatchRow) -> str:
+    m = row.model
+    if m is None or not m.source_url:
+        return "no source recorded"
+    fetched = f" fetched {m.fetched_at.isoformat()}" if m.fetched_at else ""
+    return f"[S] {m.source_url}{fetched}"
+
+
+@app.command()
+def watch(
+    config_path: str = typer.Option(DEFAULT_CONFIG_FILE, "--config"),
+    store_dir: str = typer.Option(STORE_DIRNAME, "--store-dir"),
+    registry_path: Optional[str] = typer.Option(
+        None,
+        "--registry",
+        help="A models.json newer than the one shipped with this version. A path; the CLI "
+        "never fetches.",
+    ),
+    scan_source: bool = typer.Option(
+        False,
+        "--scan",
+        help="Also read model ids from this repository's source (walks the tree; off by "
+        "default).",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Machine-readable JSON on stdout; notes go to stderr."
+    ),
+) -> None:
+    """Which of the models this repo depends on are retiring, when, and what to check next.
+
+    Reads the sourced registry shipped with this version (or --registry); never the network.
+    Every date printed carries the vendor page it was read from and the day it was read.
+
+    Exit codes: 0 every declared model is known and active; 1 a declared model is inside its
+    notice window or already retired; 3 a declared model is unknown to the registry (unknown
+    is not a clearance); 4 nothing is declared, or the registry could not be read.
+    """
+    try:
+        registry = load_registry(Path(registry_path) if registry_path else None)
+    except RegistryError as exc:
+        _fail(str(exc))
+    notes: list[str] = []
+    cfg = _load_config_or_fail(config_path)
+    declared: list[Declared] = [Declared(m, "config", "app") for m in cfg.models]
+    if cfg.judge_model:
+        declared.append(Declared(cfg.judge_model, "config", "judge"))
+    if scan_source:
+        skipped: list[str] = []
+        try:
+            hits = scan_repo(".", skipped=skipped)
+        except ScanRefusedError as exc:
+            _fail(str(exc))
+        # Only a wired-up call or an active config value is a dependency; a mention in a
+        # comment or a doc is not (MP-236), and this command decides an exit code on it.
+        for h in hits:
+            if h.get("context", "code") == "code":
+                declared.append(Declared(h["model"], "scan", "app"))
+        if skipped:
+            notes.append(
+                f"{len(skipped)} file(s) over the size cap were not scanned; a model id inside "
+                "them is not listed"
+            )
+    baselines: dict[str, str] = {}
+    for p in sorted(Path(store_dir).glob("baseline-*.json")):
+        try:
+            mid = json.loads(p.read_text(encoding="utf-8")).get("model_id")
+        except (OSError, ValueError, AttributeError):
+            notes.append(f"could not read {p}; skipped")
+            continue
+        if isinstance(mid, str) and mid:
+            baselines[mid] = str(p)
+            declared.append(Declared(mid, "baseline", "app", decides_exit=False))
+    # The offline demo replays recorded traces under `providers: [fake]`; no vendor retires a
+    # fictional model, so its rows are listed and never alarmed on (first-run audit, M1).
+    fake_only = bool(cfg.providers) and set(cfg.providers) <= {"fake"}
+    if fake_only:
+        declared = [
+            Declared(d.id, d.source, d.role, decides_exit=False) if d.source == "config" else d
+            for d in declared
+        ]
+        notes.append(
+            "providers: [fake] is the offline demo. No vendor retires a fictional model, so "
+            "there is nothing to watch here and the exit code is 0."
+        )
+    elif not any(d.decides_exit for d in declared):
+        _fail(
+            "no models declared: set `models:` in modelpin.yaml, or pass --scan to read them "
+            "from the source"
+        )
+    hosts = sorted(set(cfg.providers) & set(OPENAI_COMPATIBLE_PROVIDERS))
+
+    # Read through the module so a test can pin the calendar (`watcher._today`).
+    today = watcher_mod._today()
+    rows = assess(declared, registry, today=today, baselines=baselines)
+    code = watch_exit_code(rows)
+    newest = newest_fetch(registry)
+
+    if as_json:
+        doc = {
+            "modelpin_version": __version__,
+            "today": today.isoformat(),
+            "exit_code": code,
+            "registry": {
+                "path": registry_path,
+                "schema": REGISTRY_SCHEMA,
+                "entries": len(registry),
+                "newest_fetched_at": newest.isoformat() if newest else None,
+            },
+            "models": [
+                {
+                    "id": r.id,
+                    "sources": list(r.sources),
+                    "role": r.role,
+                    "decides_exit": r.decides_exit,
+                    "known": r.known,
+                    "status": r.model.status.value if r.model else None,
+                    "effective_status": r.effective.value if r.effective else None,
+                    "deprecated_at": (
+                        r.model.deprecated_at.isoformat()
+                        if r.model and r.model.deprecated_at
+                        else None
+                    ),
+                    "retired_at": (
+                        r.model.retired_at.isoformat() if r.model and r.model.retired_at else None
+                    ),
+                    "days_remaining": r.days_remaining,
+                    "affected": r.affected,
+                    "replacement_id": r.replacement_id,
+                    "replacement_provider": r.replacement_provider,
+                    "source_url": r.model.source_url if r.model else None,
+                    "fetched_at": (
+                        r.model.fetched_at.isoformat() if r.model and r.model.fetched_at else None
+                    ),
+                    "notes": r.model.notes if r.model else None,
+                    "modality": r.model.modality if r.model else None,
+                    "has_baseline": r.has_baseline,
+                    "baseline_path": r.baseline_path,
+                    "check_command": _watch_check_command(r),
+                    "branch": _watch_branch(r),
+                }
+                for r in rows
+            ],
+            "notes": notes,
+        }
+        # The document is the only thing on stdout; a consumer parses it whole.
+        sys.stdout.write(json.dumps(doc, indent=2) + "\n")
+        for note in notes:
+            typer.echo(f"note: {note}", err=True)
+        if code:
+            raise typer.Exit(code)
+        return
+
+    # Commands and source lines are copied by the reader; a wrapped one is broken (MP-73).
+    out = Console(file=console.file, soft_wrap=True, highlight=False)
+    # `overflow="fold"`: a narrow terminal folds a long id onto a second line rather than
+    # truncating it with an ellipsis. A table whose one job is to name models must never cut
+    # a name; the full id also appears, unwrapped, in the lines below the table.
+    table = Table(
+        Column("model", overflow="fold"),
+        Column("seen in", overflow="fold"),
+        Column("status", overflow="fold"),
+        Column("retires", overflow="fold"),
+        Column("days left", overflow="fold"),
+        Column("successor", overflow="fold"),
+        title="Models this repo depends on",
+        box=ASCII_BOX,
+    )
+    for r in rows:
+        seen = ", ".join(r.sources) + ("" if r.role == "app" else " (judge)")
+        status = r.effective.value if r.effective else "unknown"
+        retires = r.model.retired_at.isoformat() if r.model and r.model.retired_at else "-"
+        days = str(r.days_remaining) if r.days_remaining is not None else "-"
+        # `Text`, never raw strings: ids and paths are not ours to trust as markup (MP-236).
+        table.add_row(
+            Text(r.id),
+            Text(seen),
+            Text(status),
+            Text(retires),
+            Text(days),
+            Text(r.replacement_id or "-"),
+        )
+    out.print(table)
+
+    for r in rows:
+        if not r.affected or r.model is None:
+            continue
+        m = r.model
+        if r.effective is not None and r.effective.value == "retired":
+            when = (
+                f"retired {m.retired_at.isoformat()} ({-r.days_remaining} days ago)"
+                if m.retired_at and r.days_remaining is not None
+                else "retired"
+            )
+        elif m.retired_at:
+            when = f"retires {m.retired_at.isoformat()} ({r.days_remaining} days)"
+        else:
+            when = "deprecated; no shutdown date announced"
+        arrow = f" -> {r.replacement_id}" if r.replacement_id else ""
+        out.print(Text(f"  {r.id}{arrow}: {when}"))
+        out.print(Text(f"     {_watch_source_line(r)}"))
+        if m.notes:
+            out.print(Text(f"     note: {m.notes}"))
+        cmd = _watch_check_command(r)
+        if not _watch_is_chat(r):
+            out.print(
+                Text(
+                    f"     Modelpin compares chat behaviour; {r.id} is an {m.modality} model, "
+                    "so no check is suggested."
+                )
+            )
+        elif cmd is None:
+            out.print(
+                Text(
+                    "     this registry entry carries no successor: choose one and run "
+                    f"modelpin check --from {r.id} --to <model>"
+                )
+            )
+        else:
+            # The command on its own line: it is copied (first-run audit, H2). The hint below.
+            out.print(Text(f"     {cmd}"))
+            if r.role == "app":
+                hint = (
+                    f"baseline recorded: {r.baseline_path}"
+                    if r.has_baseline
+                    else f"no baseline yet: run modelpin baseline --model {r.id} first"
+                )
+                out.print(Text(f"       ({hint})"))
+    unknown = [r for r in rows if not r.known and r.decides_exit]
+    if unknown:
+        ids = ", ".join(r.id for r in unknown)
+        # Unknown is not an alarm and not a clearance. The remedy must be true for someone who
+        # installed the wheel, which ships no data/models.json to edit (first-run audit, H1).
+        if hosts:
+            remedy = (
+                "The registry covers OpenAI, Anthropic and Google model pages only, not the "
+                f"catalogues of OpenAI-compatible hosts ({', '.join(hosts)}), which rotate "
+                "without published dates, so an id served by one of them cannot be cleared "
+                "here."
+            )
+        else:
+            remedy = (
+                "A newer registry can be passed with --registry <path> (data/models.json in "
+                "the Modelpin repository); an entry needs the vendor page it comes from."
+            )
+        out.print(
+            Text(
+                f"  unknown to the registry: {ids}. This does not mean these models are "
+                "retiring, and it does not affect baseline or check; it means this command "
+                f"cannot vouch for them, and unknown is not a clearance. {remedy}"
+            )
+        )
+    advisory = [r for r in rows if not r.known and not r.decides_exit and not fake_only]
+    if advisory:
+        ids = ", ".join(r.id for r in advisory)
+        out.print(
+            Text(f"  baseline-only, not in the registry (store keys can be fictional): {ids}")
+        )
+    for note in notes:
+        out.print(Text(f"  note: {note}"))
+    origin = (
+        f"{registry_path}"
+        if registry_path
+        else f"embedded seed shipped with modelpin {__version__}"
+    )
+    fresh = f"; newest entry fetched {newest.isoformat()}" if newest else ""
+    out.print(
+        Text(
+            f"registry: {origin}, {len(registry)} entries{fresh}. Pass --registry <path> to use a "
+            "newer data/models.json."
+        )
+    )
+    if code:
+        raise typer.Exit(code)
+
+
 @app.command()
 def init(
     directory: str = typer.Argument(".", help="Repo to scaffold."),
@@ -1335,6 +1784,12 @@ def baseline(
     config_path: str = typer.Option("modelpin.yaml", "--config"),
     scenarios_dir: Optional[str] = typer.Option(None, "--scenarios-dir"),
     store_dir: str = typer.Option(STORE_DIRNAME, "--store-dir"),
+    reasoning_effort: Optional[str] = typer.Option(
+        None,
+        "--reasoning-effort",
+        help="reasoning_effort for OpenAI reasoning models (none, minimal, low, medium, high, "
+        "xhigh). Overrides `reasoning_effort:` in modelpin.yaml.",
+    ),
 ) -> None:
     """Record current model behavior for your scenarios (N runs)."""
     cfg = _load_config_or_fail(config_path)
@@ -1349,7 +1804,9 @@ def baseline(
         _fail("no model to baseline. Pass --model or set `models:` in modelpin.yaml.")
     n = _resolve_runs(runs, cfg)
     prov = _resolve_provider(provider, cfg)
-    adapter = _adapter(prov, fixtures)
+    adapter = _with_reasoning_effort(
+        _adapter(prov, fixtures), _resolve_reasoning_effort(reasoning_effort, cfg, prov)
+    )
     plan = _replay_plan(len(scenarios), src_dir, n, prov, judge_model=None)
     console.print(f"[dim]provider={prov} model={_rich_escape(from_model)} runs={n} | {plan}[/]")
     _preflight_or_fail(adapter, prov)
@@ -1471,6 +1928,12 @@ def check(
         help="Before a regression can fail the build, replay the candidate again for that "
         "scenario and require the regression to reproduce (default: on).",
     ),
+    reasoning_effort: Optional[str] = typer.Option(
+        None,
+        "--reasoning-effort",
+        help="reasoning_effort for OpenAI reasoning models (none, minimal, low, medium, high, "
+        "xhigh). Overrides `reasoning_effort:` in modelpin.yaml.",
+    ),
 ) -> None:
     """Replay scenarios on a new model and report behavioral regressions.
 
@@ -1541,7 +2004,25 @@ def check(
             store_dir,
             from_model,
             to,
-        ):
+        ) + [
+            # The previous run's migration report must not outlive a run that compared
+            # nothing, for the same reason as `last-report.md` above.
+            _write_migration_report(
+                [],
+                store_dir=store_dir,
+                from_model=from_model,
+                to_model=to,
+                provider=prov,
+                runs=runs or cfg.runs,
+                match_mode=mode,
+                judge=None,
+                judge_model=None,
+                confirm=confirm,
+                baseline_counts=[],
+                candidate_runs={},
+                skipped=[x.id for x in scenarios],
+            )
+        ]:
             console.print(_note)
         raise typer.Exit(code=EXIT_UNMEASURED)
     # [M] MP-116: an uneven baseline is scored correctly per scenario (MP-72), but it splits
@@ -1565,7 +2046,8 @@ def check(
             f"`modelpin baseline --runs {RECOMMENDED_RUNS}` for uniform coverage."
         )
     n = _resolve_runs(runs, cfg, mode=mode, baseline_sizes=[len(v) for v in base.values() if v])
-    adapter = _adapter(prov, fixtures)
+    effort = _resolve_reasoning_effort(reasoning_effort, cfg, prov)
+    adapter = _with_reasoning_effort(_adapter(prov, fixtures), effort)
     # Only scenarios that HAVE a baseline are replayed (the rest are skipped below), so
     # count those - an inflated pre-spend number is its own kind of false claim. MP-32.
     billable = sum(1 for s in scenarios if base.get(s.id))
@@ -1604,6 +2086,8 @@ def check(
         )
     _preflight_or_fail(adapter, prov)
     judge = _build_judge(prov, cfg, to_model=to, from_model=from_model)
+    # Counted for the migration report's "calls made" line; delegates every call unchanged.
+    judge = _CountingJudge(judge) if judge is not None else None
 
     results = []
     skipped: list[str] = []
@@ -1796,7 +2280,24 @@ def check(
             store_dir,
             from_model,
             to,
-        ):
+        ) + [
+            _write_migration_report(
+                [],
+                store_dir=store_dir,
+                from_model=from_model,
+                to_model=to,
+                provider=prov,
+                runs=n,
+                match_mode=mode,
+                judge=judge,
+                judge_model=cfg.judge_model,
+                confirm=confirm,
+                baseline_counts=[],
+                candidate_runs=candidate_runs,
+                rejected=rejected,
+                skipped=skipped,
+            )
+        ]:
             console.print(_note)
         raise typer.Exit(code=EXIT_UNMEASURED)
 
@@ -1845,6 +2346,33 @@ def check(
     # cost the artifact entirely and let `action.yml` republish the previous run's verdict.
     # The housekeeping notes are held and printed after the summary, so reading order is
     # unchanged: verdict first, file paths after.
+    # MP-153. Read off the traces, which record what each side was actually sent.
+    def _reasoning(fmt: Callable[[str], str]) -> Optional[ReasoningDisclosure]:
+        return reasoning_disclosure(
+            [
+                (
+                    from_model,
+                    {s.id: base.get(s.id) or [] for s in compared},
+                    _is_reasoning_model(from_model),
+                ),
+                (
+                    to,
+                    {s.id: candidate_runs.get(s.id) or [] for s in compared},
+                    _is_reasoning_model(to),
+                ),
+            ],
+            requested=effort,
+            tools_need_reasoning_off=_tools_need_reasoning_off,
+            tools_without_own_effort={
+                s.id for s in compared if s.input.get("tools") and "reasoning_effort" not in s.input
+            },
+            fmt=fmt,
+        )
+
+    reasoning = _reasoning(_md_code)
+    _console_reasoning = _reasoning(str)
+    if _console_reasoning is not None:
+        console.print(f"[dim]{_rich_escape(_console_reasoning.note)}[/]")
     markdown = render_pr_comment(
         results,
         from_model,
@@ -1861,10 +2389,33 @@ def check(
         # that declared a mode but was never diffed does not claim to have been.
         match_overrides={s.id: s.match for s in compared if s.match and s.match != mode},
         examples=examples,
+        reasoning_note=reasoning.note if reasoning is not None else None,
     )
     _exit_code = 1 if has_regression else EXIT_UNMEASURED if (unmeasured or rejected) else 0
     _publish_notes = _publish_report(
         markdown, store_dir, from_model, to, candidate_runs, results, _exit_code
+    )
+    _publish_notes.append(
+        _write_migration_report(
+            results,
+            store_dir=store_dir,
+            from_model=from_model,
+            to_model=to,
+            provider=prov,
+            runs=n,
+            match_mode=mode,
+            judge=judge,
+            judge_model=cfg.judge_model,
+            confirm=confirm,
+            baseline_counts=[len(base.get(s.id) or []) for s in compared],
+            candidate_runs=candidate_runs,
+            underpowered=underpowered,
+            census=census,
+            rejected=rejected,
+            skipped=skipped,
+            examples=examples,
+            reasoning=reasoning,
+        )
     )
     console.print(_summary)
     for _note in _publish_notes:

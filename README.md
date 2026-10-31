@@ -42,8 +42,17 @@ OK 6 scenario(s) unchanged
   Modelpin or any third party other than the model providers you configure (and, in CI, your own
   pull request).
 
-Modelpin does not watch provider release or retirement feeds and does not open pull requests on
-its own: you choose the candidate model, and a scheduled workflow can re-check it on your clock.
+`modelpin watch` crosses the models your config names (and, with `--scan`, the ones in your
+source) with a registry shipped inside each release, and tells you which of the ones **it knows**
+are retiring, when, the successor the vendor names, and the exact check to run next. Every entry
+in that registry carries the vendor page it was read from and the day it was read; a model the
+registry has never heard of is reported as unknown, never as clear. The registry is transcribed
+from OpenAI, Anthropic and Google's own deprecation and model pages, not from the catalogues
+of OpenAI-compatible
+hosts. **Nothing in Modelpin polls provider feeds**: the registry is refreshed when a release
+ships, so it is only as current as the release you installed (`--registry <path>` points at a
+newer file). Modelpin does not open pull requests on its own: you choose the candidate model,
+and a scheduled workflow can re-check it on your clock.
 
 CLI: `modelpin` (alias `mp`). License: Apache-2.0.
 
@@ -67,11 +76,11 @@ CLI: `modelpin` (alias `mp`). License: Apache-2.0.
 
 ## Install
 
-Python 3.12 or newer.
+Python 3.11 or newer.
 
 ```bash
 pip install "modelpin[providers]"      # or: pipx install "modelpin[providers]"
-modelpin version                        # -> modelpin 0.4.2
+modelpin version                        # -> modelpin 0.5.1
 ```
 
 The `providers` extra installs the OpenAI, Anthropic and Google SDKs. Plain `pip install modelpin`
@@ -110,7 +119,10 @@ You will see one scenario per verdict:
 
 The command exits **1** because regressions were found — that is what fails a CI build. The full
 report is written to `.modelpin/last-report.md`, the same file the GitHub Action posts on a pull
-request. Edit `traces.json` and re-run to watch the verdicts move.
+request. Beside it, `.modelpin/migration-report.md` tells the same result in plain English for
+whoever decides on the switch: a one-paragraph verdict, each changed scenario with a before and
+after example, what the check did not cover, and the run's date, models, runs and calls. Edit
+`traces.json` and re-run to watch the verdicts move.
 
 ## Use it on your app
 
@@ -290,7 +302,7 @@ key, is not recognised.
 
 | Provider (`providers:` / `--provider`) | Credentials | Notes |
 |---|---|---|
-| `openai` | `OPENAI_API_KEY` | Chat Completions, multi-turn tool calls. Reasoning models (`o1`/`o3`/`o4`/`gpt-5*`) get `max_completion_tokens` and no temperature |
+| `openai` | `OPENAI_API_KEY` | Chat Completions, multi-turn tool calls. Reasoning models (`o1`/`o3`/`o4`/`gpt-5*`/`gpt-6*`) get `max_completion_tokens` and no temperature |
 | `anthropic` | `ANTHROPIC_API_KEY`, **or** Claude on Vertex AI: `ANTHROPIC_VERTEX_PROJECT_ID` + `gcloud auth application-default login` (`CLOUD_ML_REGION` defaults to `global`) | Messages API, multi-turn tool calls. Newer Claude models accept only default sampling, so a scenario's `temperature` is not sent to them. Verified offline against the SDK's request shapes; not yet validated by a live run |
 | `google` | `GEMINI_API_KEY` (AI Studio), **or** Vertex AI: `GOOGLE_GENAI_USE_VERTEXAI=true` + `GOOGLE_CLOUD_PROJECT` + application-default login | Multi-turn tool calls. On Vertex, `GOOGLE_CLOUD_LOCATION` defaults to `global`; in the project's testing `gemini-3.x` ids were not served on `us-central1`, so set it only if you need a specific region |
 | `groq`, `openrouter`, `together`, `cerebras` | `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY` | OpenAI-compatible endpoints. Groq has a free tier |
@@ -300,6 +312,17 @@ It can run on any provider above; set `judge_provider:` when the model id does n
 vendor (`gpt-*`, `claude-*` and `gemini-*` do; `openai/gpt-oss-120b` on Groq does not). Choose a
 model that is neither the one you run today nor the candidate. Remove `judge_model:` to compare
 only tool calls, refusals and text checks, with no extra calls.
+
+**Reasoning effort** (OpenAI reasoning models): set `reasoning_effort:` in `modelpin.yaml`, or
+pass `--reasoning-effort` to `baseline` and `check` (both read it), to measure the effort you
+will ship (`none`, `minimal`, `low`, `medium`, `high` or `xhigh`; which values a model accepts
+is OpenAI's call). A scenario can set its own `reasoning_effort:`. It is sent only to reasoning
+models. Unset, and unless a scenario sets its own, Modelpin sends nothing, with one exception:
+`gpt-5.6` (Sol, Terra, Luna), `gpt-6-sol` and `gpt-6-luna` accept tools on Chat Completions only
+with reasoning off, so a scenario that sends tools to them runs with `none`. `last-report.md`
+(the pull-request comment) and `migration-report.md` state the effort each model was sent.
+Testing tool use on those models at another effort needs OpenAI's Responses API, which
+Modelpin does not support yet.
 
 **Cross-vendor:** the baseline and the candidate can be on different providers — record the
 baseline with one `--provider`, check with another (`modelpin check --provider google --to
@@ -337,6 +360,7 @@ current model, once.
 |---|---|
 | `modelpin init [dir]` | Write `modelpin.yaml` and a starter scenario, configured from the models your code calls. `--demo` writes the offline sandbox; `--agent-example` adds a tool-calling agent scenario. Never overwrites. |
 | `modelpin scan [path]` | List the model ids a repository (or a single file) uses, and where. |
+| `modelpin watch` | Which of the models in `modelpin.yaml` (its `models:` and `judge_model`; with `--scan`, the ids in your source; your recorded baselines are listed but never alarmed on) are retiring, when, the successor the vendor names, and the exact `check` command; every date carries its source page and fetch date. Exit `0` all clear, `1` a model is inside its notice window (a vendor deprecation, or a shutdown date within 90 days) or already retired, `3` a model is unknown to the registry (not a clearance; ids served by OpenAI-compatible hosts are unknown by design, since the registry reads the three labs' own pages), `4` nothing declared, or the config or registry could not be read. `--json` for scripts; `--registry <path>` to use a different `data/models.json` in place of the shipped one. Never touches the network. |
 | `modelpin draft <file>` | Draft scenarios from one file of your app into `scenarios/.drafts/` for review (one model call). `--count`, `--model`, `--provider`. |
 | `modelpin baseline` | Run every scenario N times on your current model and save the results. |
 | `modelpin check --to <model>` | Replay on a candidate, compare with the baseline, print verdicts, write the report, exit `0`/`1`/`3`/`4`. |
@@ -412,9 +436,15 @@ borderline change rather than raise a false alarm. Know the trade-offs:
   unmeasured.
 - **It measures change, not quality.** It never says one model is better.
 
-**What happened when it was run at scale, live:** 972 same-model checks across six Gemini
-models raised **0** false alarms, and across six real Gemini upgrades it flagged 28 regressions,
-every one of which an independent model rated a material behavior change —
+**What happened when it was run at scale, live:** 972 same-model scenario-checks across six
+Gemini models raised **0** false alarms. They are 82 scenarios re-used across models and
+repeats, not 972 independent trials, and many of those scenarios answered so consistently at
+these settings that no signal could have fired (a harness run on two of the same models put
+that at 230 of 240 trials). So this says the tool did not cry wolf in ordinary use on this
+suite; it is not a false-positive rate, and the bounds are in `docs/fp-measurement.md`.
+Across six real Gemini upgrades it flagged 28
+regressions, and a second language model asked to judge materiality rated every one a
+material behavior change, which is an opinion, not ground truth —
 [docs/live-validation.md](https://github.com/samarthputhraya/modelpin/blob/main/docs/live-validation.md),
 with the bugs that campaign found in Modelpin itself.
 
